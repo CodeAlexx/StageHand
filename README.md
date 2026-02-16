@@ -55,6 +55,18 @@ runtime.after_block("transformer_blocks.0", output_tensor)
 runtime.end_step()
 ```
 
+## Inference Eviction Behavior
+
+When `inference_mode=True`, Stagehand now uses eviction save-back policy by block type:
+
+- **File-backed / SquareQ-backed blocks**: `save_back=False` (reload from source on demand)
+- **Module-backed blocks**: `save_back=True` (prevents detached-empty parameter tensors after eviction/reload)
+
+This means inference is safe in both modes:
+
+- file-backed streaming (`convert_registry_to_file_backed_sharded(...)`) for lowest RAM pressure
+- module-backed inference when you need in-memory parameters
+
 ## Comparison with mmgp
 
 | Feature | Stagehand | mmgp |

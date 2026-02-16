@@ -467,6 +467,64 @@ class TestSchedulerEviction:
         scheduler.end_step()
 
 
+class TestSchedulerInferenceEvictionSaveBack:
+    def test_inference_mode_module_backed_eviction_saves_back(self) -> None:
+        scheduler, budget, telemetry, residency, registry = _make_scheduler(
+            num_blocks=1, prefetch_window=0, above_watermark=True,
+        )
+        scheduler._inference_mode = True
+
+        # Force one eviction pass for a synthetic module-backed block.
+        budget._below = False
+        fake_entry = MagicMock()
+        fake_entry.exec_order = 0
+        fake_entry.size_bytes = 1024
+        fake_entry.file_backed = False
+        fake_entry.squareq_backed = False
+
+        scheduler._registry.get = MagicMock(return_value=fake_entry)
+        scheduler._residency.eviction_candidates = MagicMock(
+            return_value=[("block_0", MagicMock())]
+        )
+        scheduler._policy.score_for_eviction = MagicMock(return_value=1.0)
+        scheduler._budget.below_low_watermark = MagicMock(side_effect=[False, True])
+        scheduler._evict_block = MagicMock()
+
+        scheduler._run_eviction()
+
+        assert scheduler._evict_block.call_count == 1
+        _args, kwargs = scheduler._evict_block.call_args
+        assert kwargs["save_back"] is True
+
+    def test_inference_mode_file_backed_eviction_skips_save_back(self) -> None:
+        scheduler, budget, telemetry, residency, registry = _make_scheduler(
+            num_blocks=1, prefetch_window=0, above_watermark=True,
+        )
+        scheduler._inference_mode = True
+
+        # Force one eviction pass for a synthetic file-backed block.
+        budget._below = False
+        fake_entry = MagicMock()
+        fake_entry.exec_order = 0
+        fake_entry.size_bytes = 1024
+        fake_entry.file_backed = True
+        fake_entry.squareq_backed = False
+
+        scheduler._registry.get = MagicMock(return_value=fake_entry)
+        scheduler._residency.eviction_candidates = MagicMock(
+            return_value=[("block_0", MagicMock())]
+        )
+        scheduler._policy.score_for_eviction = MagicMock(return_value=1.0)
+        scheduler._budget.below_low_watermark = MagicMock(side_effect=[False, True])
+        scheduler._evict_block = MagicMock()
+
+        scheduler._run_eviction()
+
+        assert scheduler._evict_block.call_count == 1
+        _args, kwargs = scheduler._evict_block.call_args
+        assert kwargs["save_back"] is False
+
+
 class TestSchedulerEvictionPrefetchWindow:
     def test_eviction_never_evicts_blocks_in_prefetch_window(self) -> None:
         """Spec 2.4.2: never evict a block within the prefetch window."""

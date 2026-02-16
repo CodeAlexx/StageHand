@@ -378,8 +378,9 @@ class StagehandScheduler:
     config:
         Runtime configuration.
     inference_mode:
-        If *True*, eviction always uses ``save_back=False`` (frozen blocks,
-        no gradients to preserve).
+        If *True*, eviction skips save-back only for file-backed/squareq-backed
+        blocks (immutable weights are reloaded from disk). Module-backed blocks
+        still save back to avoid detached-empty parameter tensors on reload.
     """
 
     def __init__(
@@ -822,8 +823,14 @@ class StagehandScheduler:
         for _score, bid in scored:
             if self._budget.below_low_watermark():
                 break
-            # In inference mode, never save back (blocks are frozen).
-            save_back = not self._inference_mode
+            # In inference mode, file-backed/squareq-backed blocks can skip
+            # save-back because immutable base weights are reloaded from disk.
+            # Module-backed blocks must save back or params become detached
+            # empty tensors and cannot be reconstructed on reload.
+            entry = self._registry.get(bid)
+            save_back = (not self._inference_mode) or (
+                not entry.file_backed and not entry.squareq_backed
+            )
             self._evict_block(bid, save_back=save_back)
             self._telemetry.record_eviction()
 
