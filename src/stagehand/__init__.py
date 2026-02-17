@@ -22,6 +22,7 @@ from stagehand.errors import (
     TransferError,
 )
 from stagehand.guards import NumericGuard
+from stagehand.layer import LayerRuntime
 from stagehand.pool import PinnedPool, PinnedSlab
 from stagehand.registry import BlockEntry, BlockRegistry, SquareQParamSpec
 from stagehand.residency import BlockState, ResidencyEntry, ResidencyMap
@@ -64,6 +65,11 @@ __all__ = [
     "StepMetrics",
     # runtime
     "StagehandRuntime",
+    # layer mode
+    "LayerRuntime",
+    "layer",
+    "wrap",
+    "Runtime",
 ]
 
 __version__ = "0.1.0"
@@ -352,3 +358,63 @@ class StagehandRuntime:
                 "mean_stall_ms": self._telemetry.mean_stall_ms(),
             },
         }
+
+
+# ── layer-mode top-level API ──────────────────────────────────────────────
+
+
+def layer(
+    model: nn.Module,
+    *,
+    vram_budget: str | int | None = None,
+    ram_budget: str | int | None = None,
+    prefetch_k: int = 3,
+    dtype: torch.dtype = torch.bfloat16,
+    inference_mode: bool = False,
+    telemetry: bool = True,
+    pool: PinnedPool | None = None,
+) -> nn.Module:
+    """One-line layer-mode API.  Works on any model.
+
+    Wraps individual ``nn.Linear``, ``nn.Conv2d``, ``nn.Embedding`` modules
+    and manages CPU/GPU transfer through a bounded pinned pool.
+
+    Returns the same model with hooks installed and a ``_stagehand_layer_runtime``
+    attribute pointing to the :class:`LayerRuntime` instance.
+    """
+    runtime = LayerRuntime(
+        model,
+        vram_budget=vram_budget,
+        ram_budget=ram_budget,
+        prefetch_k=prefetch_k,
+        dtype=dtype,
+        inference_mode=inference_mode,
+        telemetry=telemetry,
+        pool=pool,
+    )
+    model._stagehand_layer_runtime = runtime  # type: ignore[attr-defined]
+    return model
+
+
+def wrap(model: nn.Module, **kwargs: object) -> nn.Module:
+    """Auto-detect best mode.  Currently calls :func:`layer`."""
+    return layer(model, **kwargs)  # type: ignore[arg-type]
+
+
+class Runtime:
+    """Optional config holder for explicit configuration.
+
+    Usage::
+
+        rt = stagehand.Runtime(vram_budget="4GB", prefetch_k=5)
+        model = rt.layer(model)
+    """
+
+    def __init__(self, **kwargs: object) -> None:
+        self._kwargs = kwargs
+
+    def layer(self, model: nn.Module) -> nn.Module:
+        return layer(model, **self._kwargs)  # type: ignore[arg-type]
+
+    def wrap(self, model: nn.Module) -> nn.Module:
+        return wrap(model, **self._kwargs)

@@ -761,6 +761,44 @@ class BlockRegistry:
         self._entries = new_entries
         return converted_params
 
+    def build_from_module_list(
+        self,
+        modules: list[tuple[str, nn.Module]],
+        group: str,
+        dtype: torch.dtype,
+    ) -> None:
+        """Register an ordered list of ``(name, module)`` pairs.
+
+        Used by layer mode where modules are discovered by walking
+        ``named_modules()`` rather than matching a regex pattern.
+        ``exec_order`` is assigned from list position.  Non-breaking —
+        block-mode callers are unaffected.
+        """
+        if self._frozen:
+            raise RuntimeError("Cannot build_from_module_list on a frozen registry")
+
+        seen_ids: set[int] = set()
+        order = len(self._entries)
+
+        for name, module in modules:
+            mid = id(module)
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+
+            size = _param_size_bytes(module, dtype)
+            entry = BlockEntry(
+                block_id=name,
+                module_ref=weakref.ref(module),
+                size_bytes=size,
+                dtype=dtype,
+                dependencies=(),
+                group=group,
+                exec_order=order,
+            )
+            self._entries[name] = entry
+            order += 1
+
     # ── queries ──────────────────────────────────────────────────────
 
     def get(self, block_id: str) -> BlockEntry:
