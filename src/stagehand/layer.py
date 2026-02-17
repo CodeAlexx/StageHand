@@ -283,7 +283,21 @@ class LayerRuntime:
             inference_mode=inference_mode,
         )
 
-        # 6. Trace state.
+        # 6. Move non-managed parameters to GPU.
+        # Managed layers (Linear, Conv2d, Embedding) are offloaded by
+        # the scheduler.  Everything else (LayerNorm, biases in container
+        # modules, etc.) is tiny and should live on GPU permanently.
+        if torch.cuda.is_available():
+            managed_ids = {id(m) for m in self._layer_map.values()}
+            for module in model.modules():
+                if id(module) in managed_ids:
+                    continue
+                for p in module.parameters(recurse=False):
+                    p.data = p.data.to("cuda", dtype=dtype)
+                for name, buf in module.named_buffers(recurse=False):
+                    setattr(module, name, buf.to("cuda", dtype=dtype))
+
+        # 7. Trace state.
         self._trace_order: list[str] = []
         self._trace_seen: set[str] = set()
         self._step: int = 0
@@ -291,7 +305,7 @@ class LayerRuntime:
         self._hook_handles: list[torch.utils.hooks.RemovableHook] = []
         self._mode: str = "trace"
 
-        # 7. Install trace hooks.
+        # 8. Install trace hooks.
         self._install_trace_hooks()
 
         log.info(
