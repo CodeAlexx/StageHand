@@ -1,122 +1,70 @@
 # Stagehand
 
-**GPU memory orchestrator for large model inference and training.**
+GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU so models larger than VRAM can run without quantization.
 
-Run 64GB+ models on 24GB GPUs. No quantization. No quality loss.
+**Status**: Alpha (`0.1.0`). Five commits. API may change. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training.
 
-## What It Does
+## How it works
 
-Stagehand manages GPU VRAM like a stage manager manages actors: loading what's needed, unloading what's not, and prefetching what's next.
+Stagehand keeps most model weights on CPU (in pinned memory or on disk) and streams them to GPU one layer/block at a time, through a fixed-size pool. The core loop:
 
-- **Block-swap streaming**: Stream transformer blocks through VRAM one at a time via file-backed sources
-- **Pinned memory pools**: Pre-allocated CPU↔GPU transfer lanes for zero-allocation copies
-- **Async prefetch**: Overlap compute and data transfer so the GPU stalls less
-- **VRAM budget tracking**: Hard budget enforcement with automatic eviction
-- **File-backed registry**: Weights can stay on disk instead of full CPU RAM residency
+1. **Pre-forward hook fires** → load this layer's weights from pinned CPU slab to GPU via async DMA copy on a dedicated CUDA stream
+2. **Forward runs** on GPU with weights resident
+3. **Post-forward hook fires** → mark layer done, decrement refcount
+4. **Eviction** → when VRAM usage crosses a high watermark, evict least-soon-needed layers back to CPU (or drop them if they can be reloaded from disk)
+5. **Prefetch** → after each layer, issue async copies for the next *k* layers so they arrive before they're needed
 
-## Install
+The GPU never runs out of memory because the pool is bounded and eviction is enforced.
 
-```bash
-pip install stagehand
-```
+### What actually happens to the weights
 
-## Quick Start
+- **Module-backed** (default): Weights live in CPU RAM. On load: copy to GPU tensor, repoint `module.weight.data` into it. On eviction: copy back to CPU, repoint back. This is a full round-trip every time.
+- **File-backed**: Weights live on disk as safetensors. On load: mmap read → pinned slab → GPU. On eviction (inference): just drop the GPU tensor — weights reload from disk on next use. No CPU RAM needed for frozen weights.
+- **SquareQ-backed**: INT8 quantized format (`.fpk`/`.slab`). Dequantized to target dtype during host staging. Same eviction behavior as file-backed.
 
-```python
-import torch
-from stagehand import StagehandConfig, StagehandRuntime
+## Two modes
 
-model = ...  # torch.nn.Module
-
-cfg = StagehandConfig(
-    pinned_pool_mb=8192,
-    pinned_slab_mb=2048,
-    vram_high_watermark_mb=20000,
-    vram_low_watermark_mb=16000,
-    prefetch_window_blocks=2,
-    max_inflight_transfers=1,
-)
-
-runtime = StagehandRuntime(
-    model=model,
-    config=cfg,
-    block_pattern=r"^(transformer_blocks\.\d+|single_transformer_blocks\.\d+)$",
-    group="transformer",
-    dtype=torch.bfloat16,
-    inference_mode=True,
-)
-
-runtime.convert_registry_to_file_backed_sharded("/path/to/transformer/shards")
-
-runtime.begin_step(0)
-runtime.before_block("transformer_blocks.0")
-# run the block...
-runtime.after_block("transformer_blocks.0", output_tensor)
-runtime.end_step()
-```
-
-## Layer Mode (NEW)
-
-One line, zero config, works on **any** model:
+### Layer mode — zero config
 
 ```python
 import stagehand
 
-model = YourModel()
 model = stagehand.layer(model)
 
-# Just use the model normally — Stagehand handles the rest
-for batch in dataloader:
-    output = model(batch)
+# Use normally. Stagehand handles everything.
+output = model(input)
 ```
 
-Layer mode wraps individual `nn.Linear`, `nn.Conv2d`, and `nn.Embedding` modules and manages CPU/GPU transfer through a bounded pinned pool. It uses a two-phase lifecycle:
+Wraps every `nn.Linear`, `nn.Conv2d`, and `nn.Embedding` in the model. Everything else (LayerNorm, biases, buffers) stays on GPU permanently — they're small.
 
-1. **Trace** (step 0): Records actual execution order with zero prefetch
-2. **Scheduled** (step 1+): Rebuilds the registry with traced order and enables k-lookahead prefetch
+**Two-phase lifecycle:**
+- **Step 0 (trace)**: No prefetch. Forward hooks record actual execution order. When the first layer fires a second time, trace completes automatically.
+- **Step 1+ (scheduled)**: Registry rebuilt with traced order. `prefetch_k` layers are loaded ahead. Auto-step detection — you never call `begin_step()`/`end_step()`.
 
-Auto-step detection means you never call `begin_step()`/`end_step()` — Stagehand detects when a new forward pass begins.
-
-### Configuration
-
+**Options:**
 ```python
-# Explicit VRAM budget
-model = stagehand.layer(model, vram_budget="8GB")
-
-# Custom prefetch depth
-model = stagehand.layer(model, prefetch_k=5)
-
-# Inference mode (no backward hooks)
-model = stagehand.layer(model, inference_mode=True)
-
-# Reusable config
-rt = stagehand.Runtime(vram_budget="4GB", prefetch_k=5)
-model = rt.layer(model)
+stagehand.layer(model,
+    vram_budget="8GB",      # VRAM cap (default: 80% of detected)
+    ram_budget="16GB",      # Pinned pool cap
+    prefetch_k=3,           # Lookahead depth (default: 3)
+    dtype=torch.bfloat16,   # Storage dtype (default: bfloat16)
+    inference_mode=True,    # Skip backward hooks
+    telemetry=False,        # Disable JSONL logging
+)
 ```
 
-### Shutdown and Pool Reuse
+**Pool auto-sizing**: Slab size = next power-of-2 MiB above the largest layer. Pool = `(prefetch_k + 4)` slabs. VRAM watermarks: 80% high, 60% low of detected VRAM.
 
-```python
-runtime = model._stagehand_layer_runtime
+### Block mode — explicit control
 
-# Clean shutdown
-runtime.shutdown()
-
-# Or keep pool for reuse
-pool = runtime.shutdown_keep_pool()
-model2 = stagehand.layer(other_model, pool=pool)
-```
-
-## Block Mode
-
-For transformer models with known block patterns, block mode gives you explicit control:
+For transformer models where you know the block structure:
 
 ```python
 from stagehand import StagehandConfig, StagehandRuntime
 
 cfg = StagehandConfig(
-    pinned_pool_mb=8192,
-    pinned_slab_mb=2048,
+    pinned_pool_mb=8192,         # 8 GB pinned pool
+    pinned_slab_mb=2048,         # 2 GB per slab (= 4 slabs)
     vram_high_watermark_mb=20000,
     vram_low_watermark_mb=16000,
     prefetch_window_blocks=2,
@@ -126,32 +74,120 @@ runtime = StagehandRuntime(
     model=model,
     config=cfg,
     block_pattern=r"^transformer_blocks\.\d+$",
+    dtype=torch.bfloat16,
     inference_mode=True,
 )
+
+# File-backed: weights stream from disk, not CPU RAM
+runtime.convert_registry_to_file_backed_sharded("/path/to/shards")
+
+# Manual step lifecycle
+with runtime.managed_forward():
+    output = model(input)
+runtime.end_step()
 ```
 
-## Inference Eviction Behavior
+Block mode gives you control over the block pattern regex, pool sizing, watermarks, and step lifecycle. It supports file-backed and SquareQ-backed streaming that layer mode doesn't (layer mode is module-backed only).
 
-When `inference_mode=True`, Stagehand now uses eviction save-back policy by block type:
+## Install
 
-- **File-backed / SquareQ-backed blocks**: `save_back=False` (reload from source on demand)
-- **Module-backed blocks**: `save_back=True` (prevents detached-empty parameter tensors after eviction/reload)
+```bash
+pip install stagehand
+```
 
-This means inference is safe in both modes:
+Requires Python ≥3.10, PyTorch ≥2.1.0, safetensors ≥0.4.0, psutil ≥5.9.0.
 
-- file-backed streaming (`convert_registry_to_file_backed_sharded(...)`) for lowest RAM pressure
-- module-backed inference when you need in-memory parameters
+Works without CUDA (pool uses unpinned memory, transfers are synchronous copies). Useful for testing, not useful for actual offloading.
 
-## Comparison with mmgp
+## RamTorch compatibility shim
 
-| Feature | Stagehand | mmgp |
-|---------|-----------|------|
-| File-backed mmap streaming | ✅ | ❌ |
-| Async prefetch overlap | ✅ | Partial |
-| VRAM budget enforcement | ✅ | ✅ |
-| Pinned memory pools | ✅ | ✅ |
-| CPU RAM requirement | Low (file-backed mode) | Higher |
-| PyPI package | ✅ | ✅ |
+Drop-in replacement for `ramtorch.helpers`. Lets RamTorch users (e.g. SimpleTuner) switch to Stagehand with a one-line import change:
+
+```python
+# Before:
+from ramtorch.helpers import replace_linear_with_ramtorch, move_model_to_device
+
+# After:
+from stagehand.compat.ramtorch import replace_linear_with_ramtorch, move_model_to_device
+```
+
+The shim calls `stagehand.layer()` internally and sets `is_ramtorch = True` on managed modules/params so downstream `getattr(param, "is_ramtorch", False)` checks (quantization skip, DDP ignore, device move skip) continue to work.
+
+`move_model_to_device()` becomes a no-op when Stagehand is active. `reattach_is_ramtorch_flags()` restores flags after `torch.save`/`torch.load`.
+
+## Internals
+
+### Pool (`PinnedPool`)
+
+Fixed-size pool of page-locked CPU memory slabs. All slabs allocated at init — no runtime allocation. Acquisition blocks on a condition variable if no slabs are free (logs a warning at 100ms). Slabs are 512-byte aligned for DMA.
+
+### Transfer engine (`AsyncTransferEngine`)
+
+Dedicated high-priority CUDA stream (`priority=-1`). Backpressure via `max_inflight` (default: 2). Each H2D/D2H copy records a CUDA event for synchronization. The default stream waits on the copy event before using the data.
+
+### Scheduler (`StagehandScheduler`)
+
+`before_block(block_id)`:
+- If layer is already on GPU → prefetch hit
+- If layer is mid-transfer → wait for completion (stall)
+- Otherwise → initiate load (stall + miss)
+- Then: prefetch next *k* layers, run eviction if above watermark
+
+Eviction scoring: `score = distance_to_next_use * size_bytes`. Blocks in the prefetch window are protected from eviction. Eviction runs until VRAM drops below the low watermark.
+
+### Residency state machine
+
+```
+UNLOADED → HOST_STAGED → PREFETCHING → GPU_READY → EVICTING → HOST_STAGED
+                                                  → GPU_FREEING → UNLOADED
+```
+
+Every transition is validated. Invalid transitions raise `InvalidStateTransitionError`. Refcounted — a block with `refcount > 0` is never evicted.
+
+### Telemetry
+
+Per-step metrics written to JSONL: H2D/D2H bytes, stall time/count, eviction count, prefetch hit/miss, VRAM usage, pool utilization, NaN/Inf counts. Rolling 100-step window for aggregate stats (hit rate, mean stall, VRAM trend).
+
+### Numeric guards (block mode only)
+
+Optional `strict_bf16` checking, NaN/Inf detection on block outputs, dtype promotion detection. Disabled in layer mode.
+
+## Shutdown
+
+```python
+runtime = model._stagehand_layer_runtime
+
+# Full shutdown — releases pool, closes telemetry, removes hooks
+runtime.shutdown()
+
+# Or keep pool for reuse with another model
+pool = runtime.shutdown_keep_pool()
+model2 = stagehand.layer(other_model, pool=pool)
+```
+
+Double `shutdown()` is safe (idempotent).
+
+## Tests
+
+147 tests, all pass without a GPU. Run with:
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -x -q
+```
+
+Covers: pool allocation/release, all 6 residency state transitions (and all invalid ones), registry build/validate/freeze, scheduler prefetch/eviction/stall, layer discovery/trace/rebuild/auto-step, compat shim API + functional correctness, numeric guards, budget watermarks, telemetry recording.
+
+Functional correctness tests verify forward output matches the unwrapped model with `atol=1e-5` on both trace and scheduled passes.
+
+## Limitations
+
+- **Layer mode is module-backed only**. No file-backed or SquareQ streaming. Every eviction round-trips weights through CPU RAM.
+- **No multi-GPU support**. Single device only.
+- **Prefetch policy is static**. Fixed lookahead window, no adaptive prediction.
+- **No gradient checkpointing integration**. Stagehand's backward hooks coexist with PyTorch's autograd but don't coordinate with `torch.utils.checkpoint`.
+- **Pool sizing is fragile**. If the largest layer doesn't fit in one slab, init fails with `StagehandOOMError`. Auto-sizing in layer mode handles this, but block mode requires manual slab sizing.
+- **Alpha quality**. Five commits, used in one project. The API surface is small but not battle-tested.
 
 ## License
 
