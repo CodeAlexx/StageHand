@@ -169,25 +169,26 @@ Double `shutdown()` is safe (idempotent).
 
 ## Tests
 
-147 tests, all pass without a GPU. Run with:
+204 tests (169 CPU-only + 35 GPU stress tests). Run with:
 
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -x -q
 ```
 
-Covers: pool allocation/release, all 6 residency state transitions (and all invalid ones), registry build/validate/freeze, scheduler prefetch/eviction/stall, layer discovery/trace/rebuild/auto-step, compat shim API + functional correctness, numeric guards, budget watermarks, telemetry recording.
+**CPU tests** (run anywhere): pool allocation/release, all 6 residency state transitions (and all invalid ones), registry build/validate/freeze, scheduler prefetch/eviction/stall, layer discovery/trace/rebuild/auto-step, compat shim API + functional correctness, numeric guards, budget watermarks, telemetry recording. Functional correctness tests verify forward output matches the unwrapped model with `atol=1e-5` on both trace and scheduled passes.
 
-Functional correctness tests verify forward output matches the unwrapped model with `atol=1e-5` on both trace and scheduled passes.
+**GPU stress tests** (require CUDA, auto-skipped otherwise): real H2D/D2H async transfers, VRAM budgeting with eviction under pressure, gradient survival across evict→reload cycles, OffloadedAdamW state placement, bf16 dtype preservation through D2H→H2D round-trips, training convergence matching vanilla AdamW, RamTorch compat shim training, no-VRAM-leak stress (50 steps), pool reuse across models, and large model (80MB, 40 layers) completion with telemetry verification.
 
 ## Limitations
 
 - **Layer mode is module-backed only**. No file-backed or SquareQ streaming. Every eviction round-trips weights through CPU RAM.
 - **No multi-GPU support**. Single device only.
 - **Prefetch policy is static**. Fixed lookahead window, no adaptive prediction.
+- **Gradient accumulation + tight VRAM budget**. When eviction happens during backward, PyTorch's `AccumulateGrad` node runs after the backward post-hook — so eviction moves `param.grad` to CPU before `AccumulateGrad` can accumulate on GPU, causing a device mismatch. Workaround: use a generous VRAM budget for gradient accumulation so no eviction occurs during backward. Single forward+backward per step (the common case) works fine with any budget.
 - **No gradient checkpointing integration**. Stagehand's backward hooks coexist with PyTorch's autograd but don't coordinate with `torch.utils.checkpoint`.
 - **Pool sizing is fragile**. If the largest layer doesn't fit in one slab, init fails with `StagehandOOMError`. Auto-sizing in layer mode handles this, but block mode requires manual slab sizing.
-- **Alpha quality**. Five commits, used in one project. The API surface is small but not battle-tested.
+- **Alpha quality**. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training. The API surface is small but not battle-tested.
 
 ## License
 
