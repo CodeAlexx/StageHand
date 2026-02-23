@@ -624,6 +624,11 @@ class StagehandScheduler:
             if state in (BlockState.GPU_READY, BlockState.PREFETCHING):
                 continue
 
+            # Don't prefetch if VRAM is already near the high watermark —
+            # block will be demand-loaded by before_block when actually needed.
+            if not self._budget.can_prefetch():
+                break
+
             self._load_block_to_gpu(block_id)
 
     def _load_block_to_gpu(self, block_id: str) -> None:
@@ -637,6 +642,16 @@ class StagehandScheduler:
 
         block_entry = self._registry.get(block_id)
         res_entry = self._residency.get_entry(block_id)
+
+        # Module-backed blocks larger than one slab: params live on the module
+        # itself (on CPU after eviction).  Move directly to GPU without going
+        # through the pinned-slab pipeline, which returns a list of slabs for
+        # oversized blocks and breaks submit_h2d.
+        is_module_backed = not block_entry.file_backed and not block_entry.squareq_backed
+        slab_bytes = self._engine._pool._slab_bytes if hasattr(self._engine._pool, "_slab_bytes") else float("inf")
+        if is_module_backed and state == BlockState.UNLOADED and block_entry.size_bytes > slab_bytes:
+            self._load_module_backed_direct(block_id, block_entry, res_entry)
+            return
 
         if state == BlockState.UNLOADED:
             # Stage to host first, then submit H2D.
@@ -734,6 +749,61 @@ class StagehandScheduler:
 
         self._residency.transition(block_entry.block_id, BlockState.HOST_STAGED)
         return slab
+
+    def _load_module_backed_direct(
+        self,
+        block_id: str,
+        block_entry: BlockEntry,
+        res_entry: ResidencyEntry,
+    ) -> None:
+        """Load module-backed params to GPU without pinned slabs.
+
+        Module-backed blocks store their data as CPU tensors on the module
+        itself (set during eviction).  We build a param layout, allocate a
+        contiguous GPU tensor (so the VRAM budget tracks it), flatten CPU
+        params into it, then restore param views — same as the normal path
+        but skipping the pinned-slab intermediary that can't handle multi-slab
+        blocks for module-backed data.
+        """
+        module = block_entry.module_ref()
+        if module is None:
+            return
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Build param layout from the current CPU params.
+        layout = _build_param_layout(module, block_entry.dtype)
+        res_entry.param_layout = layout
+
+        # Allocate contiguous GPU buffer (tracked by VRAM budget).
+        numel = block_entry.size_bytes // block_entry.dtype.itemsize
+        gpu_tensor = torch.empty(numel, dtype=block_entry.dtype, device=device)
+        res_entry.gpu_tensor = gpu_tensor
+
+        # Flatten CPU params directly into the GPU tensor.
+        gpu_bytes = gpu_tensor.view(torch.uint8)
+        params = dict(module.named_parameters())
+        for name, _shape, dtype, offset_bytes, param_numel in layout:
+            param = params[name]
+            elem_size = dtype.itemsize
+            nbytes = param_numel * elem_size
+            region = gpu_bytes[offset_bytes : offset_bytes + nbytes].view(dtype)
+            region.copy_(param.data.to(dtype).reshape(-1))
+
+        # Restore module params as views into the contiguous GPU tensor.
+        _restore_params_from_tensor(module, gpu_bytes, layout)
+
+        # Move accumulated .grad tensors to GPU.
+        for param in module.parameters():
+            if param.grad is not None and param.grad.device.type != device:
+                param.grad = param.grad.to(device, non_blocking=True)
+
+        # Walk through valid state transitions:
+        # UNLOADED → HOST_STAGED → PREFETCHING → GPU_READY
+        self._residency.transition(block_id, BlockState.HOST_STAGED)
+        self._residency.transition(block_id, BlockState.PREFETCHING)
+        self._residency.transition(block_id, BlockState.GPU_READY)
+        self._telemetry.record_h2d(block_entry.size_bytes)
 
     def _finalize_gpu_load(self, block_id: str) -> None:
         """After H2D transfer completes, restore module params from GPU tensor.
@@ -849,6 +919,28 @@ class StagehandScheduler:
         module = block_entry.module_ref()
 
         if save_back:
+            # Module-backed blocks larger than one slab: params live on the
+            # module itself.  Copy each GPU param to a standalone CPU tensor —
+            # no slab needed.  Smaller module-backed blocks use the normal
+            # slab-based D2H path.
+            is_module_backed = not block_entry.file_backed and not block_entry.squareq_backed
+            slab_bytes = self._engine._pool._slab_bytes if hasattr(self._engine._pool, "_slab_bytes") else float("inf")
+            if is_module_backed and block_entry.size_bytes > slab_bytes:
+                self._residency.transition(block_id, BlockState.EVICTING)
+                if module is not None:
+                    for param in module.parameters():
+                        if param.data.device.type != "cpu":
+                            param.data = param.data.to("cpu", non_blocking=True).clone()
+                        if param.grad is not None and param.grad.device.type != "cpu":
+                            param.grad = param.grad.to("cpu", non_blocking=True)
+                res_entry.gpu_tensor = None
+                if res_entry.host_slab is not None:
+                    self._engine._pool.release(res_entry.host_slab)
+                    res_entry.host_slab = None
+                res_entry.param_layout = None
+                self._residency.transition(block_id, BlockState.UNLOADED)
+                return
+
             # File-backed blocks keep frozen base params on disk. On eviction,
             # only mutable params (e.g. LoRA) need CPU save-back.
             if block_entry.file_backed:

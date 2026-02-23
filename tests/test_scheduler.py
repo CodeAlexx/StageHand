@@ -30,12 +30,16 @@ from stagehand.transfer import AsyncTransferEngine
 class MockBudget:
     """Simple mock that toggles above/below watermark."""
 
-    def __init__(self, above: bool = False) -> None:
+    def __init__(self, above: bool = False, *, allow_prefetch: bool = True) -> None:
         self._above = above
         self._below = True
+        self._allow_prefetch = allow_prefetch
 
     def above_high_watermark(self) -> bool:
         return self._above
+
+    def can_prefetch(self) -> bool:
+        return self._allow_prefetch
 
     def below_low_watermark(self) -> bool:
         return self._below
