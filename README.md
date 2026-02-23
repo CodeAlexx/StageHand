@@ -2,7 +2,9 @@
 
 GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU so models larger than VRAM can run without quantization.
 
-**Status**: Alpha (`0.1.0`). Five commits. API may change. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training.
+**Status**: Alpha (`0.1.0`). API may change. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training.
+
+**Case study**: [LTX-2 19B + Gemma 3 12B trained in full bf16 on a single 24GB GPU](docs/case-study-ltx2-bf16.md) — 31.9B total parameters, no quantization, 9.5s/step.
 
 ## How it works
 
@@ -169,7 +171,7 @@ Double `shutdown()` is safe (idempotent).
 
 ## Tests
 
-204 tests (169 CPU-only + 35 GPU stress tests). Run with:
+205 tests (170 CPU-only + 35 GPU stress tests). Run with:
 
 ```bash
 pip install -e ".[dev]"
