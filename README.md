@@ -6,6 +6,12 @@ GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU s
 
 **Case study**: [LTX-2 19B + Gemma 3 12B trained in full bf16 on a single 24GB GPU](docs/case-study-ltx2-bf16.md) — 31.9B total parameters, no quantization, 9.5s/step.
 
+## Docs
+
+- [Activation Stagehand](docs/activation-stagehand.md) — spilling autograd activations to pinned CPU memory
+- [Per-Layer & Per-Component Learning Rates](docs/per-layer-lr.md) — 2D LR grid (component type x block depth) for LoRA and full-finetune training
+- [Case Study: LTX-2 bf16 on 24GB](docs/case-study-ltx2-bf16.md) — two-stage Stagehand training of a 31.9B parameter model
+
 ## How it works
 
 Stagehand keeps most model weights on CPU (in pinned memory or on disk) and streams them to GPU one layer/block at a time, through a fixed-size pool. The core loop:

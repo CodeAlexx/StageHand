@@ -229,3 +229,8 @@ Both systems share PCIe bandwidth. Activation Stagehand uses separate CUDA strea
 | **CUDA streams** | Shared high-priority stream | Separate dedicated streams |
 | **Lifecycle** | Block enter/exit hooks | `saved_tensors_hooks` pack/unpack |
 | **Persistence** | Weights survive across steps | Activations cleared each step |
+
+## See Also
+
+- [Per-Layer & Per-Component Learning Rates](per-layer-lr.md) — fine-grained LR scheduling across transformer blocks, orthogonal to Stagehand
+- [Case Study: LTX-2 bf16 on 24GB](case-study-ltx2-bf16.md) — two-stage training using both Weight and Activation Stagehand
