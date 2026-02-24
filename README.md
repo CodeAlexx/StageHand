@@ -11,6 +11,7 @@ GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU s
 - [Activation Stagehand](docs/activation-stagehand.md) — spilling autograd activations to pinned CPU memory
 - [Per-Layer & Per-Component Learning Rates](docs/per-layer-lr.md) — 2D LR grid (component type x block depth) for LoRA and full-finetune training
 - [Conductor](docs/conductor.md) — resource arbitration across weight Stagehand, Activation Stagehand, and SquareQ
+- [Selective Precision](docs/selective-precision.md) — per-block BF16/INT8 routing based on gradient sensitivity
 - [Case Study: LTX-2 bf16 on 24GB](docs/case-study-ltx2-bf16.md) — two-stage Stagehand training of a 31.9B parameter model
 
 ## How it works
