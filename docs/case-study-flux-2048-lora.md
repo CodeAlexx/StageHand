@@ -173,15 +173,15 @@ Flux's transformer blocks pass tensors as keyword arguments, not just positional
 
 ## Batch Size Scaling
 
-At 2048x2048, batch size is the limiting factor:
+At 2048x2048 with activation offloading, batch size scales cleanly:
 
-| Batch Size | Result |
-|------------|--------|
-| 1 | 4.15 GB, 32 s/step |
-| 2 | OOM |
-| 4 | OOM |
+| Batch Size | VRAM | Step Time | Result |
+|------------|------|-----------|--------|
+| 1 | 4.15 GB | 32 s | Stable |
+| 2 | 4.16 GB | 61 s | Stable |
+| 4 | OOM | — | Exceeds budget |
 
-Activation memory scales linearly with batch size. At 2048x2048, even one batch's activations are close to the ceiling. Gradient accumulation (multiple batch-1 steps per optimizer step) is the path to effective larger batches without more VRAM.
+Batch 2 fits at the same VRAM as batch 1 because activation offloading moves intermediate tensors to CPU between layers — doubling the batch only doubles the per-layer activation size, which is small enough to absorb. Step time roughly doubles (32s to 61s) due to twice the computation per step. Batch 4 exceeds the per-layer activation budget and OOMs.
 
 ## Context: Why This Matters
 
