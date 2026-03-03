@@ -5,8 +5,9 @@ GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU s
 **Status**: Alpha (`0.1.0`). API may change. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training.
 
 **Case studies**:
-- [LTX-2 19B + Gemma 3 12B trained in full bf16 on a single 24GB GPU](docs/case-study-ltx2-bf16.md) — 31.9B total parameters, no quantization, 9.5s/step.
-- [Flux 2 Dev 12B + Mistral 3 24B with SquareQ INT8 on a single 24GB GPU](docs/case-study-flux2dev-squareq.md) — 36B total parameters, INT8 frozen weights, 6 GB VRAM steady state.
+- [LTX-2 19B + Gemma 3 12B trained in full bf16 on a single 24GB GPU](docs/case-study-ltx2-bf16.md) — 31.9B total parameters, no quantization, 9.5s/step
+- [Flux 2 Dev 12B + Mistral 3 24B with SquareQ INT8 on a single 24GB GPU](docs/case-study-flux2dev-squareq.md) — 36B total parameters, INT8 frozen weights, 6 GB VRAM steady state
+- [Flux 1 Dev 12B LoRA at 2048x2048 on 4.15 GB VRAM](docs/case-study-flux-2048-lora.md) — full bf16, no quantization, 90% of layers offloaded to CPU
 
 ## Docs
 
@@ -16,6 +17,7 @@ GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU s
 - [Selective Precision](docs/selective-precision.md) — per-block BF16/INT8 routing based on gradient sensitivity
 - [Case Study: LTX-2 bf16 on 24GB](docs/case-study-ltx2-bf16.md) — two-stage Stagehand training of a 31.9B parameter model
 - [Case Study: Flux 2 Dev + SquareQ INT8 on 24GB](docs/case-study-flux2dev-squareq.md) — SquareQ-backed Stagehand training of a 36B parameter model
+- [Case Study: Flux 1 Dev at 2048x2048](docs/case-study-flux-2048-lora.md) — 12B model LoRA training using 4.15 GB VRAM via LayerOffloadConductor
 
 ## How it works
 
