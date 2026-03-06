@@ -67,10 +67,15 @@ class SquareQParamSpec:
 
 
 def _param_size_bytes(module: nn.Module, dtype: torch.dtype) -> int:
-    """Sum of all parameter sizes in *module* when stored as *dtype*."""
+    """Sum of all parameter sizes in *module* using actual param dtypes.
+
+    The *dtype* argument is kept for API compatibility but ignored —
+    each parameter's real dtype is used so that mixed-precision models
+    (e.g. FP8 + bf16) report their true memory footprint.
+    """
     total = 0
     for p in module.parameters():
-        total += p.numel() * dtype.itemsize
+        total += p.numel() * p.dtype.itemsize
     return total
 
 

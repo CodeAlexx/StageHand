@@ -76,15 +76,15 @@ class TestBlockRegistry:
         assert orders == list(range(5))
 
     def test_size_bytes_calculation(self) -> None:
-        """size_bytes matches manual calculation: weight + bias in target dtype."""
+        """size_bytes matches manual calculation using actual param dtypes."""
         model = _make_mock_model(num_blocks=1, in_features=1024, out_features=1024)
         reg = BlockRegistry()
         reg.build_from_model(model, block_pattern=r"^block\.\d+$", group="wan", dtype=torch.bfloat16)
 
         entry = reg.blocks_in_order()[0]
         # Linear(1024, 1024): weight = 1024*1024 params, bias = 1024 params
-        # bf16 = 2 bytes per element
-        expected = (1024 * 1024 + 1024) * 2
+        # Actual param dtype is fp32 (4 bytes) — size_bytes uses real dtype
+        expected = (1024 * 1024 + 1024) * 4
         assert entry.size_bytes == expected
 
     def test_get_existing_block(self) -> None:

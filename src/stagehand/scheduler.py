@@ -150,14 +150,19 @@ def _build_param_layout(
 
     Returns a list of ``(param_name, shape, dtype, offset_bytes, num_elements)``
     tuples describing how each parameter is packed into a flat buffer.
+
+    Each parameter uses its **actual** dtype (not the passed *dtype*) so that
+    mixed-precision models (e.g. FP8 weights + bf16 biases) are laid out
+    correctly without unwanted casting.
     """
     layout: list[tuple[str, tuple[int, ...], torch.dtype, int, int]] = []
     offset = 0
     for name, param in module.named_parameters():
+        p_dtype = param.dtype
         numel = param.numel()
-        elem_size = dtype.itemsize
+        elem_size = p_dtype.itemsize
         nbytes = numel * elem_size
-        layout.append((name, tuple(param.shape), dtype, offset, numel))
+        layout.append((name, tuple(param.shape), p_dtype, offset, numel))
         offset += nbytes
     return layout
 
@@ -167,7 +172,11 @@ def _flatten_params_into_buffer(
     buffer: torch.Tensor,
     layout: list[tuple[str, tuple[int, ...], torch.dtype, int, int]],
 ) -> None:
-    """Copy module parameters into a uint8 *buffer* according to *layout*."""
+    """Copy module parameters into a uint8 *buffer* according to *layout*.
+
+    Parameters are copied at their **actual** dtype (recorded in the layout)
+    without casting, so mixed-precision models are preserved faithfully.
+    """
     params = dict(module.named_parameters())
     for name, _shape, dtype, offset_bytes, numel in layout:
         param = params[name]
@@ -175,7 +184,7 @@ def _flatten_params_into_buffer(
         nbytes = numel * elem_size
         # Get a typed view into the buffer region.
         region = buffer[offset_bytes : offset_bytes + nbytes].view(dtype)
-        region.copy_(param.data.to(dtype).reshape(-1))
+        region.copy_(param.data.reshape(-1))
 
 
 def _copy_file_backed_params_into_buffer(
@@ -660,12 +669,14 @@ class StagehandScheduler:
             state = self._residency.get_state(block_id)  # now HOST_STAGED
 
         if state == BlockState.HOST_STAGED:
-            # Allocate GPU tensor if needed.
+            # Allocate GPU tensor if needed.  Use uint8 as a raw byte buffer
+            # so that mixed-precision blocks (e.g. FP8 + bf16 params) get the
+            # correct total allocation size.  The tensor is viewed as uint8
+            # during param restoration anyway.
             if res_entry.gpu_tensor is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
-                numel = block_entry.size_bytes // block_entry.dtype.itemsize
                 res_entry.gpu_tensor = torch.empty(
-                    numel, dtype=block_entry.dtype, device=device
+                    block_entry.size_bytes, dtype=torch.uint8, device=device
                 )
 
             # Submit H2D transfer.
@@ -775,9 +786,8 @@ class StagehandScheduler:
         layout = _build_param_layout(module, block_entry.dtype)
         res_entry.param_layout = layout
 
-        # Allocate contiguous GPU buffer (tracked by VRAM budget).
-        numel = block_entry.size_bytes // block_entry.dtype.itemsize
-        gpu_tensor = torch.empty(numel, dtype=block_entry.dtype, device=device)
+        # Allocate contiguous GPU buffer as raw bytes (tracked by VRAM budget).
+        gpu_tensor = torch.empty(block_entry.size_bytes, dtype=torch.uint8, device=device)
         res_entry.gpu_tensor = gpu_tensor
 
         # Flatten CPU params directly into the GPU tensor.
@@ -788,7 +798,7 @@ class StagehandScheduler:
             elem_size = dtype.itemsize
             nbytes = param_numel * elem_size
             region = gpu_bytes[offset_bytes : offset_bytes + nbytes].view(dtype)
-            region.copy_(param.data.to(dtype).reshape(-1))
+            region.copy_(param.data.reshape(-1))
 
         # Restore module params as views into the contiguous GPU tensor.
         _restore_params_from_tensor(module, gpu_bytes, layout)
