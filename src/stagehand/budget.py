@@ -43,6 +43,7 @@ class BudgetManager:
             )
         self._high_watermark_mb = high_watermark_mb
         self._low_watermark_mb = low_watermark_mb
+        self._reserved_bytes: int = 0
 
     # ── raw queries ──────────────────────────────────────────────────
 
@@ -80,6 +81,36 @@ class BudgetManager:
         """True if usage is below the high watermark (normal ops or opportunistic)."""
         return not self.above_high_watermark()
 
+    # ── reservation ────────────────────────────────────────────────
+
+    def reserve_bytes(self, amount: int, label: str = "") -> None:
+        """Subtract *amount* from effective budget available for guest/normal models.
+
+        Does not allocate VRAM — it constrains future guest allocation decisions.
+        """
+        self._reserved_bytes += amount
+
+    def release_reserved_bytes(self, amount: int) -> None:
+        """Release previously reserved bytes back to the guest pool."""
+        self._reserved_bytes = max(0, self._reserved_bytes - amount)
+
+    @property
+    def reserved_bytes(self) -> int:
+        """Total bytes currently reserved for protected resident models."""
+        return self._reserved_bytes
+
+    def can_guest_allocate(self, requested_bytes: int, safety_margin_mb: int = 500) -> bool:
+        """Check if a guest model can load without displacing protected residents.
+
+        Evaluates against headroom AFTER subtracting reserved bytes and a
+        safety margin from the total budget.
+        """
+        budget_bytes = self._high_watermark_mb * 1024 * 1024
+        used_bytes = int(self.vram_used_mb() * 1024 * 1024)
+        safety_bytes = safety_margin_mb * 1024 * 1024
+        effective_available = budget_bytes - used_bytes - self._reserved_bytes - safety_bytes
+        return requested_bytes <= effective_available
+
     # ── introspection ────────────────────────────────────────────────
 
     @property
@@ -91,8 +122,10 @@ class BudgetManager:
         return self._low_watermark_mb
 
     def __repr__(self) -> str:
+        reserved_mb = self._reserved_bytes / (1024 * 1024)
         return (
             f"BudgetManager(high={self._high_watermark_mb}MB, "
             f"low={self._low_watermark_mb}MB, "
-            f"used={self.vram_used_mb():.0f}MB)"
+            f"used={self.vram_used_mb():.0f}MB, "
+            f"reserved={reserved_mb:.0f}MB)"
         )

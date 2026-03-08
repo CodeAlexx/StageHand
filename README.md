@@ -15,6 +15,7 @@ GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU s
 - [Per-Layer & Per-Component Learning Rates](docs/per-layer-lr.md) — 2D LR grid (component type x block depth) for LoRA and full-finetune training
 - [Conductor](docs/conductor.md) — resource arbitration across weight Stagehand, Activation Stagehand, and SquareQ
 - [Selective Precision](docs/selective-precision.md) — per-block BF16/INT8 routing based on gradient sensitivity
+- [Residency Protection](docs/residency-protection.md) — `keep_resident()`, `reserve_for_resident()`, and guest model scoping for multi-model VRAM management
 - [Case Study: LTX-2 bf16 on 24GB](docs/case-study-ltx2-bf16.md) — two-stage Stagehand training of a 31.9B parameter model
 - [Case Study: Flux 2 Dev + SquareQ INT8 on 24GB](docs/case-study-flux2dev-squareq.md) — SquareQ-backed Stagehand training of a 36B parameter model
 - [Case Study: Flux 1 Dev at 2048x2048](docs/case-study-flux-2048-lora.md) — 12B model LoRA training using 4.15 GB VRAM via LayerOffloadConductor

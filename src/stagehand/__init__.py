@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Generator
 
 import torch
@@ -25,7 +26,7 @@ from stagehand.guards import NumericGuard
 from stagehand.layer import LayerRuntime
 from stagehand.pool import PinnedPool, PinnedSlab
 from stagehand.registry import BlockEntry, BlockRegistry, SquareQParamSpec
-from stagehand.residency import BlockState, ResidencyEntry, ResidencyMap
+from stagehand.residency import BlockState, ResidencyEntry, ResidencyMap, ResidentPriority
 from stagehand.scheduler import StaticLookaheadPolicy, StagehandScheduler
 from stagehand.telemetry import StagehandTelemetry, StepMetrics
 from stagehand.transfer import AsyncTransferEngine, TransferHandle
@@ -50,6 +51,7 @@ __all__ = [
     "BlockState",
     "ResidencyEntry",
     "ResidencyMap",
+    "ResidentPriority",
     # transfer
     "AsyncTransferEngine",
     "TransferHandle",
@@ -75,6 +77,16 @@ __all__ = [
 __version__ = "0.1.0"
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class _ReservationEntry:
+    """Internal tracking for reserve_for_resident."""
+
+    runtime: object  # StagehandRuntime (forward ref)
+    size_bytes: int
+    block_ids: frozenset[str]
+    priority: ResidentPriority
 
 
 class StagehandRuntime:
@@ -317,6 +329,145 @@ class StagehandRuntime:
         finally:
             for h in handles:
                 h.remove()
+
+    # ── residency protection ─────────────────────────────────────────
+
+    @contextmanager
+    def keep_resident(self, model_or_runtime: StagehandRuntime | None = None) -> Generator[None, None, None]:
+        """Suppress eviction of blocks for the duration of the context.
+
+        Blocks with refcount 0 will not be selected as eviction candidates
+        while this context is active. On context exit, protection is lifted.
+        Explicit eviction must be called separately if the model should be
+        unloaded.
+
+        If *model_or_runtime* is another ``StagehandRuntime``, its block IDs
+        are used. If ``None``, protects this runtime's own blocks.
+
+        Example::
+
+            with runtime.keep_resident():
+                result1 = model.generate(...)
+                result2 = model.encode(...)
+            # blocks are now normal eviction candidates again
+        """
+        target = model_or_runtime if model_or_runtime is not None else self
+        block_ids = frozenset(
+            entry.block_id for entry in target._registry.blocks_in_order()
+        )
+        if not block_ids:
+            log.warning(
+                "keep_resident: no blocks found. Model may not be registered "
+                "with Stagehand."
+            )
+            yield
+            return
+
+        self._scheduler.protect_blocks(block_ids)
+        log.debug("keep_resident: protecting %d blocks", len(block_ids))
+        try:
+            yield
+        finally:
+            self._scheduler.unprotect_blocks(block_ids)
+            log.debug("keep_resident: released protection for %d blocks", len(block_ids))
+
+    def reserve_for_resident(
+        self,
+        model_or_runtime: StagehandRuntime | None = None,
+        priority: ResidentPriority = ResidentPriority.PRIMARY,
+    ) -> None:
+        """Reserve VRAM headroom for a model that must stay resident.
+
+        Effects:
+        - All blocks are marked with the given priority
+        - BudgetManager subtracts model's size from "available for guests"
+        - Scheduler will not select PRIMARY blocks as eviction candidates
+          while reservation is active
+
+        If *model_or_runtime* is ``None``, reserves this runtime's own blocks.
+        """
+        target = model_or_runtime if model_or_runtime is not None else self
+        block_ids = frozenset(
+            entry.block_id for entry in target._registry.blocks_in_order()
+        )
+        size_bytes = sum(
+            entry.size_bytes for entry in target._registry.blocks_in_order()
+        )
+
+        if not hasattr(self, "_reservations"):
+            self._reservations: dict[int, _ReservationEntry] = {}
+
+        self._reservations[id(target)] = _ReservationEntry(
+            runtime=target,
+            size_bytes=size_bytes,
+            block_ids=block_ids,
+            priority=priority,
+        )
+
+        if priority == ResidentPriority.PRIMARY:
+            self._scheduler.protect_blocks(block_ids)
+        self._budget.reserve_bytes(size_bytes, label=repr(target))
+
+        log.info(
+            "reserve_for_resident: reserved %.2fGB (%d blocks) at priority=%s",
+            size_bytes / 1e9,
+            len(block_ids),
+            priority.value,
+        )
+
+    def release_reservation(
+        self,
+        model_or_runtime: StagehandRuntime | None = None,
+    ) -> None:
+        """Release a reservation, returning headroom to the guest pool."""
+        target = model_or_runtime if model_or_runtime is not None else self
+        if not hasattr(self, "_reservations"):
+            return
+        reservation = self._reservations.pop(id(target), None)
+        if reservation is None:
+            return
+        if reservation.priority == ResidentPriority.PRIMARY:
+            self._scheduler.unprotect_blocks(reservation.block_ids)
+        self._budget.release_reserved_bytes(reservation.size_bytes)
+        log.info(
+            "release_reservation: released %.2fGB reservation",
+            reservation.size_bytes / 1e9,
+        )
+
+    @contextmanager
+    def as_guest(self, guest_runtime: StagehandRuntime) -> Generator[None, None, None]:
+        """Load a short-lived guest model, evaluated against guest headroom only.
+
+        If insufficient guest headroom exists, the prefetch window is reduced.
+        Protected PRIMARY blocks are never evicted to make room for guests.
+        On context exit, the guest reservation is released.
+
+        Example::
+
+            with conductor.as_guest(spatial_upscaler):
+                result = spatial_upscaler.run(latent)
+            # guest_runtime evicted on context exit
+        """
+        size_bytes = sum(
+            entry.size_bytes for entry in guest_runtime._registry.blocks_in_order()
+        )
+
+        prev_window = None
+        if not self._budget.can_guest_allocate(size_bytes):
+            prev_window = self._scheduler._policy.prefetch_window
+            self._scheduler._policy.prefetch_window = 1
+            log.warning(
+                "as_guest: tight headroom for guest (%.2fGB), reduced prefetch window",
+                size_bytes / 1e9,
+            )
+
+        self.reserve_for_resident(guest_runtime, priority=ResidentPriority.GUEST)
+        try:
+            yield
+        finally:
+            self.release_reservation(guest_runtime)
+            if prev_window is not None:
+                self._scheduler._policy.prefetch_window = prev_window
 
     # ── shutdown ──────────────────────────────────────────────────────
 

@@ -511,6 +511,16 @@ class StagehandScheduler:
         self._squareq_layers[key] = layers
         return layers
 
+    def protect_blocks(self, block_ids: frozenset[str] | set[str]) -> None:
+        """Mark blocks as protected from eviction."""
+        self._residency.protect_blocks(block_ids)
+        log.debug("Scheduler: protecting %d blocks", len(block_ids))
+
+    def unprotect_blocks(self, block_ids: frozenset[str] | set[str]) -> None:
+        """Remove eviction protection from blocks."""
+        self._residency.unprotect_blocks(block_ids)
+        log.debug("Scheduler: unprotected %d blocks", len(block_ids))
+
     def close(self) -> None:
         """Release open file-backed mmap resources."""
         for handle, mm, view in self._file_maps.values():
@@ -913,6 +923,25 @@ class StagehandScheduler:
             )
             self._evict_block(bid, save_back=save_back)
             self._telemetry.record_eviction()
+
+        # Last-resort fallback: if still above high watermark and NO normal
+        # candidates remain, evict LRU protected blocks rather than deadlocking.
+        if not self._budget.below_low_watermark() and self._budget.above_high_watermark():
+            protected = self._residency.protected_eviction_candidates()
+            for bid, _entry in protected:
+                if self._budget.below_low_watermark():
+                    break
+                log.warning(
+                    "keep_resident: forced to evict protected block %s "
+                    "due to critical VRAM pressure. No other candidates available.",
+                    bid,
+                )
+                entry = self._registry.get(bid)
+                save_back = (not self._inference_mode) or (
+                    not entry.file_backed and not entry.squareq_backed
+                )
+                self._evict_block(bid, save_back=save_back)
+                self._telemetry.record_eviction()
 
     def _evict_block(self, block_id: str, save_back: bool = False) -> None:
         """Evict a block from GPU.
