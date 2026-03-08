@@ -1,5 +1,7 @@
 # Case Study: Flux 1 Dev 12B LoRA at 2048x2048 on 4.15 GB VRAM
 
+> **Note**: This case study uses Stagehand within [Serenity](https://github.com/CodeAlexx/Serenity). The training framework, model loading, and LoRA management are Serenity code — Stagehand provides the block-swapping runtime.
+
 Training a 12-billion-parameter image diffusion model (Flux 1 Dev) with LoRA at 2048x2048 resolution, full bfloat16 precision, using only 4.15 GB of a 24 GB GPU.
 
 No quantization. No model sharding. 90% of transformer layers offloaded to CPU.

@@ -4,21 +4,25 @@ GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU s
 
 **Status**: Alpha (`0.1.0`). API may change. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training.
 
-**Case studies**:
+**Case studies** (these use Stagehand within [Serenity](https://github.com/CodeAlexx/Serenity)):
 - [LTX-2 19B + Gemma 3 12B trained in full bf16 on a single 24GB GPU](docs/case-study-ltx2-bf16.md) — 31.9B total parameters, no quantization, 9.5s/step
 - [Flux 2 Dev 12B + Mistral 3 24B with SquareQ INT8 on a single 24GB GPU](docs/case-study-flux2dev-squareq.md) — 36B total parameters, INT8 frozen weights, 6 GB VRAM steady state
 - [Flux 1 Dev 12B LoRA at 2048x2048 on 4.15 GB VRAM](docs/case-study-flux-2048-lora.md) — full bf16, no quantization, 90% of layers offloaded to CPU
 
 ## Docs
 
-- [Activation Stagehand](docs/activation-stagehand.md) — spilling autograd activations to pinned CPU memory
-- [Per-Layer & Per-Component Learning Rates](docs/per-layer-lr.md) — 2D LR grid (component type x block depth) for LoRA and full-finetune training
-- [Conductor](docs/conductor.md) — resource arbitration across weight Stagehand, Activation Stagehand, and SquareQ
-- [Selective Precision](docs/selective-precision.md) — per-block BF16/INT8 routing based on gradient sensitivity
+### Stagehand library
+
 - [Residency Protection](docs/residency-protection.md) — `keep_resident()`, `reserve_for_resident()`, and guest model scoping for multi-model VRAM management
-- [Case Study: LTX-2 bf16 on 24GB](docs/case-study-ltx2-bf16.md) — two-stage Stagehand training of a 31.9B parameter model
-- [Case Study: Flux 2 Dev + SquareQ INT8 on 24GB](docs/case-study-flux2dev-squareq.md) — SquareQ-backed Stagehand training of a 36B parameter model
-- [Case Study: Flux 1 Dev at 2048x2048](docs/case-study-flux-2048-lora.md) — 12B model LoRA training using 4.15 GB VRAM via LayerOffloadConductor
+
+### Serenity integration
+
+These features are built on top of Stagehand but implemented in [Serenity](https://github.com/CodeAlexx/Serenity), not in this library:
+
+- [Activation Stagehand](docs/activation-stagehand.md) — spilling autograd activations to pinned CPU memory
+- [Conductor](docs/conductor.md) — resource arbitration across weight Stagehand, Activation Stagehand, and SquareQ
+- [Per-Layer & Per-Component Learning Rates](docs/per-layer-lr.md) — 2D LR grid (component type x block depth) for LoRA and full-finetune training
+- [Selective Precision](docs/selective-precision.md) — per-block BF16/INT8 routing based on gradient sensitivity
 
 ## How it works
 
@@ -129,7 +133,9 @@ from stagehand.compat.ramtorch import replace_linear_with_ramtorch, move_model_t
 
 The shim calls `stagehand.layer()` internally and sets `is_ramtorch = True` on managed modules/params so downstream `getattr(param, "is_ramtorch", False)` checks (quantization skip, DDP ignore, device move skip) continue to work.
 
-`move_model_to_device()` becomes a no-op when Stagehand is active. `reattach_is_ramtorch_flags()` restores flags after `torch.save`/`torch.load`.
+`move_model_to_device()` becomes a no-op when Stagehand is active (and skips `is_ramtorch` params in fallback mode). `reattach_is_ramtorch_flags()` restores flags after `torch.save`/`torch.load`. Hook helpers (`register_ramtorch_grad_hook`, `register_ramtorch_post_accumulate_grad_hook`, `add_custom_hooks`) are also provided for full API parity.
+
+**Limitation**: Stagehand wraps modules with hooks instead of replacing them with a different class. Code that uses `isinstance(module, ramtorch.Linear)` to identify managed modules will get `False` — use `getattr(module, "is_ramtorch", False)` instead.
 
 ## Internals
 
@@ -185,14 +191,14 @@ Double `shutdown()` is safe (idempotent).
 
 ## Tests
 
-205 tests (170 CPU-only + 35 GPU stress tests). Run with:
+228 tests (193 CPU-only + 35 GPU stress tests). Run with:
 
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -x -q
 ```
 
-**CPU tests** (run anywhere): pool allocation/release, all 6 residency state transitions (and all invalid ones), registry build/validate/freeze, scheduler prefetch/eviction/stall, layer discovery/trace/rebuild/auto-step, compat shim API + functional correctness, numeric guards, budget watermarks, telemetry recording. Functional correctness tests verify forward output matches the unwrapped model with `atol=1e-5` on both trace and scheduled passes.
+**CPU tests** (run anywhere): pool allocation/release, all 6 residency state transitions (and all invalid ones), registry build/validate/freeze, scheduler prefetch/eviction/stall, layer discovery/trace/rebuild/auto-step, compat shim API + functional correctness, numeric guards, budget watermarks, telemetry recording, residency protection (`keep_resident`, `reserve_for_resident`, `as_guest` scoping). Functional correctness tests verify forward output matches the unwrapped model with `atol=1e-5` on both trace and scheduled passes.
 
 **GPU stress tests** (require CUDA, auto-skipped otherwise): real H2D/D2H async transfers, VRAM budgeting with eviction under pressure, gradient survival across evict→reload cycles, OffloadedAdamW state placement, bf16 dtype preservation through D2H→H2D round-trips, training convergence matching vanilla AdamW, RamTorch compat shim training, no-VRAM-leak stress (50 steps), pool reuse across models, and large model (80MB, 40 layers) completion with telemetry verification.
 

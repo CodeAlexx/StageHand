@@ -1,5 +1,7 @@
 # Case Study: LTX-2 19B Full bf16 Training on 24GB VRAM
 
+> **Note**: This case study uses Stagehand within [Serenity](https://github.com/CodeAlexx/Serenity). The training framework, model loading, and orchestration are Serenity code — Stagehand provides the block-swapping runtime.
+
 Training a 19-billion-parameter video diffusion model (LTX-2) with a 12-billion-parameter text encoder (Gemma 3), all in full bfloat16 precision, on a single 24GB GPU using Stagehand block-swapping.
 
 No quantization. No model sharding across GPUs. One card.

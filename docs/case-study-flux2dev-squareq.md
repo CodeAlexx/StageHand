@@ -1,5 +1,7 @@
 # Case Study: Flux 2 Dev LoRA Training with SquareQ INT8 on 24GB VRAM
 
+> **Note**: This case study uses Stagehand within [Serenity](https://github.com/CodeAlexx/Serenity). The training framework, model loading, and SquareQ integration are Serenity code — Stagehand provides the block-swapping runtime.
+
 Training a 12-billion-parameter image diffusion model (Flux 2 Dev) with a 24-billion-parameter text encoder (Mistral 3), using SquareQ INT8 quantization for frozen weights and Stagehand block-swapping, on a single 24GB GPU.
 
 SquareQ stores frozen transformer weights in INT8, dequantizing to bf16 on-the-fly during block loading. Combined with Stagehand's block-swapping, this keeps peak VRAM at ~6 GB for a model that needs ~60 GB in full precision.

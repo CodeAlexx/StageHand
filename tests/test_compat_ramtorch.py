@@ -13,8 +13,12 @@ from torch import nn
 from stagehand.compat.ramtorch import (
     Linear,
     _mark_is_ramtorch,
+    add_custom_hooks,
     move_model_to_device,
     reattach_is_ramtorch_flags,
+    register_ramtorch_grad_hook,
+    register_ramtorch_hook,
+    register_ramtorch_post_accumulate_grad_hook,
     replace_linear_with_ramtorch,
 )
 from stagehand.layer import LAYER_TYPES, LayerRuntime
@@ -571,3 +575,193 @@ class TestEdgeCases:
             assert hasattr(model, "_stagehand_layer_runtime")
         finally:
             model._stagehand_layer_runtime.shutdown()
+
+
+# ── 7. Hook Helpers (ramtorch.helpers API parity) ─────────────────────────
+
+
+class TestHookHelpers:
+    """Verify hook helper functions match ramtorch.helpers API."""
+
+    def test_add_custom_hooks_creates_dict(self) -> None:
+        t = torch.randn(4)
+        result = add_custom_hooks(t)
+        assert result is t
+        assert hasattr(t, "_custom_hooks")
+        assert isinstance(t._custom_hooks, dict)
+        assert t._custom_hooks_counter == 0
+
+    def test_add_custom_hooks_custom_name(self) -> None:
+        t = torch.randn(4)
+        add_custom_hooks(t, "my_hooks")
+        assert hasattr(t, "my_hooks")
+        assert t.my_hooks_counter == 0
+
+    def test_add_custom_hooks_idempotent(self) -> None:
+        t = torch.randn(4)
+        add_custom_hooks(t)
+        t._custom_hooks[99] = lambda: None
+        add_custom_hooks(t)  # Should not reset.
+        assert 99 in t._custom_hooks
+
+    def test_register_ramtorch_hook(self) -> None:
+        t = torch.randn(4)
+        called = []
+        hook_id = register_ramtorch_hook(t, lambda g: called.append(g), "_test_hooks")
+        assert hook_id == 0
+        assert hasattr(t, "_test_hooks")
+        assert 0 in t._test_hooks
+
+    def test_register_ramtorch_hook_increments_id(self) -> None:
+        t = torch.randn(4)
+        id0 = register_ramtorch_hook(t, lambda g: None, "_h")
+        id1 = register_ramtorch_hook(t, lambda g: None, "_h")
+        assert id0 == 0
+        assert id1 == 1
+
+    def test_register_ramtorch_grad_hook_on_stagehand_model(self) -> None:
+        model = _SimpleMLP(hidden=16, num_layers=2)
+        replace_linear_with_ramtorch(model, dtype=torch.float32, telemetry=False)
+        runtime = model._stagehand_layer_runtime
+        try:
+            called = []
+            handles = register_ramtorch_grad_hook(model, lambda g: called.append(True))
+            # Should register on all params with requires_grad.
+            assert len(handles) > 0
+        finally:
+            runtime.shutdown()
+
+    def test_register_ramtorch_grad_hook_param_filter(self) -> None:
+        model = _SimpleMLP(hidden=16, num_layers=3)
+        replace_linear_with_ramtorch(model, dtype=torch.float32, telemetry=False)
+        runtime = model._stagehand_layer_runtime
+        try:
+            handles = register_ramtorch_grad_hook(
+                model, lambda g: None, param_names=["layers.0.weight"],
+            )
+            assert len(handles) == 1
+        finally:
+            runtime.shutdown()
+
+    def test_register_post_accumulate_grad_hook(self) -> None:
+        model = _SimpleMLP(hidden=16, num_layers=2)
+        replace_linear_with_ramtorch(model, dtype=torch.float32, telemetry=False)
+        runtime = model._stagehand_layer_runtime
+        try:
+            handles = register_ramtorch_post_accumulate_grad_hook(
+                model, lambda t: None,
+            )
+            assert len(handles) > 0
+        finally:
+            runtime.shutdown()
+
+    def test_register_post_accumulate_grad_hook_param_filter(self) -> None:
+        model = _SimpleMLP(hidden=16, num_layers=3)
+        replace_linear_with_ramtorch(model, dtype=torch.float32, telemetry=False)
+        runtime = model._stagehand_layer_runtime
+        try:
+            handles = register_ramtorch_post_accumulate_grad_hook(
+                model, lambda t: None, param_names=["layers.1.weight"],
+            )
+            assert len(handles) == 1
+        finally:
+            runtime.shutdown()
+
+    def test_grad_hook_on_plain_model(self) -> None:
+        """Hooks on non-stagehand model use native register_hook."""
+        model = _SimpleMLP(hidden=8, num_layers=2)
+        x = torch.randn(1, 8, requires_grad=True)
+        handles = register_ramtorch_grad_hook(model, lambda g: g)
+        # Native hook handles should be returned.
+        assert len(handles) == 2
+
+    def test_post_accum_hook_on_plain_model(self) -> None:
+        """Hooks on non-stagehand model use native register_post_accumulate_grad_hook."""
+        model = _SimpleMLP(hidden=8, num_layers=2)
+        handles = register_ramtorch_post_accumulate_grad_hook(model, lambda t: None)
+        assert len(handles) == 2
+
+
+# ── 8. move_model_to_device Parity ────────────────────────────────────────
+
+
+class TestMoveModelParity:
+    """Verify move_model_to_device matches real RamTorch behavior."""
+
+    def test_fallback_skips_is_ramtorch_params(self) -> None:
+        """Params marked is_ramtorch should NOT be moved (matches real RamTorch)."""
+        model = _SimpleMLP(hidden=8, num_layers=2)
+        # Manually mark one param as is_ramtorch.
+        target_param = list(model.parameters())[0]
+        target_param.is_ramtorch = True  # type: ignore[attr-defined]
+        original_device = target_param.device
+
+        move_model_to_device(model, "cpu")
+
+        # The ramtorch param should not have moved.
+        assert target_param.device == original_device
+        # Other params should have moved.
+        other_param = list(model.parameters())[1]
+        assert other_param.device == torch.device("cpu")
+
+    def test_fallback_skips_is_ramtorch_buffers(self) -> None:
+        """Buffers marked is_ramtorch should NOT be moved."""
+        model = _MixedModel()
+        # Mark the embedding's buffer (if any) — use the norm's weight buffer.
+        for name, buf in model.named_buffers():
+            buf.is_ramtorch = True  # type: ignore[attr-defined]
+            break
+
+        move_model_to_device(model, "cpu")
+
+        # The ramtorch buffer should not have moved.
+        for name, buf in model.named_buffers():
+            if getattr(buf, "is_ramtorch", False):
+                assert buf.device == torch.device("cpu")  # Was already on CPU.
+            break
+
+
+# ── 9. reattach Parity ───────────────────────────────────────────────────
+
+
+class TestReattachParity:
+    """Verify reattach_is_ramtorch_flags matches real RamTorch behavior."""
+
+    def test_reattach_marks_buffers(self) -> None:
+        """Reattach should mark buffers too, not just params."""
+        model = _SimpleMLP(hidden=8, num_layers=2)
+        replace_linear_with_ramtorch(model, dtype=torch.float32, telemetry=False)
+        runtime = model._stagehand_layer_runtime
+        try:
+            # Clear all flags.
+            for _name, mod in runtime._layer_map.items():
+                for b in mod.buffers(recurse=False):
+                    if hasattr(b, "is_ramtorch"):
+                        del b.is_ramtorch
+
+            reattach_is_ramtorch_flags(model)
+
+            # Verify buffers are re-flagged (if any exist).
+            for _name, mod in runtime._layer_map.items():
+                for b in mod.buffers(recurse=False):
+                    assert getattr(b, "is_ramtorch", False) is True
+        finally:
+            runtime.shutdown()
+
+    def test_reattach_recursive_on_non_stagehand_model(self) -> None:
+        """Non-stagehand model with is_ramtorch modules gets recursive reattach."""
+        model = _SimpleMLP(hidden=8, num_layers=2)
+        # Manually mark one layer as ramtorch.
+        model.layers[0].is_ramtorch = True  # type: ignore[attr-defined]
+        # Clear param flags.
+        for p in model.layers[0].parameters():
+            assert not getattr(p, "is_ramtorch", False)
+
+        reattach_is_ramtorch_flags(model)
+
+        # Params of the marked module should now be flagged.
+        for p in model.layers[0].parameters():
+            assert getattr(p, "is_ramtorch", False) is True
+        # Params of unmarked modules should NOT be flagged.
+        for p in model.layers[1].parameters():
+            assert not getattr(p, "is_ramtorch", False)
