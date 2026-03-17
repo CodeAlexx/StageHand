@@ -8,6 +8,7 @@ GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU s
 - [LTX-2 19B + Gemma 3 12B trained in full bf16 on a single 24GB GPU](docs/case-study-ltx2-bf16.md) — 31.9B total parameters, no quantization, 9.5s/step
 - [Flux 2 Dev 12B + Mistral 3 24B with SquareQ INT8 on a single 24GB GPU](docs/case-study-flux2dev-squareq.md) — 36B total parameters, INT8 frozen weights, 6 GB VRAM steady state
 - [Flux 1 Dev 12B LoRA at 2048x2048 on 4.15 GB VRAM](docs/case-study-flux-2048-lora.md) — full bf16, no quantization, 90% of layers offloaded to CPU
+- [Porting the Conductor to LTX-Desktop](docs/case-study-ltx-desktop-conductor.md) — LTX-2 19B LoRA on 24 GB, and the `use_reentrant` gradient bug with dataclass block interfaces
 
 ## Docs
 
