@@ -67,16 +67,48 @@ class SquareQParamSpec:
 
 
 def _param_size_bytes(module: nn.Module, dtype: torch.dtype) -> int:
-    """Sum of all parameter sizes in *module* using actual param dtypes.
-
-    The *dtype* argument is kept for API compatibility but ignored —
-    each parameter's real dtype is used so that mixed-precision models
-    (e.g. FP8 + bf16) report their true memory footprint.
-    """
+    """Sum of all parameter sizes in *module* when stored as *dtype*."""
     total = 0
     for p in module.parameters():
-        total += p.numel() * p.dtype.itemsize
+        total += p.numel() * dtype.itemsize
     return total
+
+
+def _resolve_param_owner(module: nn.Module, dotted_name: str) -> tuple[nn.Module | None, str | None]:
+    """Return the owning submodule and leaf attribute for a dotted parameter name."""
+    parts = dotted_name.split(".")
+    current: nn.Module | None = module
+    for part in parts[:-1]:
+        if current is None or not hasattr(current, part):
+            return None, None
+        current = getattr(current, part)
+    return current, parts[-1] if parts else None
+
+
+def _should_keep_module_param_resident(module: nn.Module, dotted_name: str, param: nn.Parameter) -> bool:
+    """Return True when a parameter should stay module-backed instead of file-backed.
+
+    Tiny normalization parameters are not worth evicting and some model
+    families, including LTX2, expect their shapes to stay intact across
+    Stagehand block swaps.
+    """
+    owner, leaf_name = _resolve_param_owner(module, dotted_name)
+    if owner is None or leaf_name not in {"weight", "bias"}:
+        return False
+
+    norm_types = (
+        nn.RMSNorm,
+        nn.LayerNorm,
+        nn.GroupNorm,
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+    )
+    if isinstance(owner, norm_types):
+        return True
+
+    owner_name = owner.__class__.__name__.lower()
+    return "norm" in owner_name and int(param.ndim) <= 1
 
 
 # ── data ─────────────────────────────────────────────────────────────────
@@ -99,6 +131,7 @@ class BlockEntry:
     exec_order: int
     quant_format: str | None = None
     quant_meta_bytes: int = 0
+    eriquant_qtype: str | None = None
     # File-backed mode metadata. Empty for module-backed blocks.
     source_path: str | None = None
     source_format: str | None = None
@@ -115,7 +148,11 @@ class BlockEntry:
 
     @property
     def squareq_backed(self) -> bool:
-        return self.source_format == "squareq_bp8" and len(self.squareq_param_specs) > 0
+        return self.source_format in ("squareq_bp8", "squareq_v2") and len(self.squareq_param_specs) > 0
+
+    @property
+    def eriquant_backed(self) -> bool:
+        return self.quant_format == "eriquant"
 
 
 # ── registry ─────────────────────────────────────────────────────────────
@@ -232,6 +269,11 @@ class BlockRegistry:
             (".ffn.net.2.", ".ffn.2."),
             (".norm2.", ".norm3."),
             ("scale_shift_table", "modulation"),
+            # Flux 2 FF layer aliases (diffusers ↔ checkpoint names)
+            ("ff.net.0.proj", "ff.linear_in"),
+            ("ff.net.2", "ff.linear_out"),
+            ("ff_context.net.0.proj", "ff_context.linear_in"),
+            ("ff_context.net.2", "ff_context.linear_out"),
         )
 
         while queue:
@@ -257,7 +299,22 @@ class BlockRegistry:
                 if alias and alias not in seen:
                     queue.append(alias)
 
-        return tuple(f"{block_id}.{name}" for name in names)
+        candidates: list[str] = []
+        candidate_seen: set[str] = set()
+        key_prefixes = (
+            "",
+            "model.diffusion_model.",
+            "diffusion_model.",
+            "model.",
+        )
+        for prefix in key_prefixes:
+            for name in names:
+                candidate = f"{prefix}{block_id}.{name}"
+                if candidate in candidate_seen:
+                    continue
+                candidate_seen.add(candidate)
+                candidates.append(candidate)
+        return tuple(candidates)
 
     @staticmethod
     def _candidate_squareq_layer_keys(block_id: str, param_name: str) -> tuple[str, ...]:
@@ -269,36 +326,15 @@ class BlockRegistry:
             base_name = base_name[:-5]
         elif base_name in {"weight", "bias"}:
             base_name = ""
+        # Strip adapter wrapper suffixes that appear at end-of-name
+        # (the BFS tokens only match mid-name occurrences like ".orig.X").
+        for suffix in (".orig", ".org_module", ".base_layer"):
+            if base_name.endswith(suffix):
+                base_name = base_name[: -len(suffix)]
+                break
         if not base_name:
             return (block_id,)
         return BlockRegistry._candidate_tensor_keys(block_id, base_name)
-
-    @staticmethod
-    def _drop_param_storage(module: nn.Module, param_name: str, param: nn.Parameter) -> None:
-        """Release parameter storage while preserving module parameter wiring.
-
-        Torch rejects ``param.data = cpu_tensor`` when the existing parameter is
-        CUDA-backed or meta-backed. In those cases we replace the Parameter
-        object at its owning module path with an empty CPU parameter.
-        """
-        empty = torch.empty(0, dtype=param.dtype, device="cpu")
-        with torch.no_grad():
-            if param.device.type == "cpu" and not param.is_meta:
-                param.data = empty
-                if param.grad is not None:
-                    param.grad = None
-                return
-
-            owner: nn.Module = module
-            parts = param_name.split(".")
-            for part in parts[:-1]:
-                owner = owner[int(part)] if part.isdigit() else getattr(owner, part)
-            leaf = parts[-1]
-            replacement = nn.Parameter(empty, requires_grad=param.requires_grad)
-            if hasattr(owner, "_parameters") and leaf in owner._parameters:
-                owner._parameters[leaf] = replacement
-            else:
-                setattr(owner, leaf, replacement)
 
     @staticmethod
     def _load_squareq_manifest(
@@ -469,6 +505,9 @@ class BlockRegistry:
                 if param.requires_grad:
                     module_param_names.append(param_name)
                     continue
+                if _should_keep_module_param_resident(module, param_name, param):
+                    module_param_names.append(param_name)
+                    continue
 
                 tensor_meta = None
                 for tensor_key in self._candidate_tensor_keys(block_id, param_name):
@@ -496,7 +535,10 @@ class BlockRegistry:
                 converted_params += 1
 
                 if drop_module_tensors:
-                    self._drop_param_storage(module, param_name, param)
+                    with torch.no_grad():
+                        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                        if param.grad is not None:
+                            param.grad = None
 
             if file_specs:
                 new_entry = replace(
@@ -606,6 +648,9 @@ class BlockRegistry:
                 if param.requires_grad:
                     module_param_names.append(param_name)
                     continue
+                if _should_keep_module_param_resident(module, param_name, param):
+                    module_param_names.append(param_name)
+                    continue
 
                 tensor_meta = None
                 for tensor_key in self._candidate_tensor_keys(block_id, param_name):
@@ -634,7 +679,10 @@ class BlockRegistry:
                 converted_params += 1
 
                 if drop_module_tensors:
-                    self._drop_param_storage(module, param_name, param)
+                    with torch.no_grad():
+                        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                        if param.grad is not None:
+                            param.grad = None
 
             if file_specs:
                 new_entry = replace(
@@ -692,6 +740,9 @@ class BlockRegistry:
                 if param.requires_grad:
                     module_param_names.append(param_name)
                     continue
+                if _should_keep_module_param_resident(module, param_name, param):
+                    module_param_names.append(param_name)
+                    continue
 
                 kind: str | None = None
                 if param_name.endswith(".weight") or param_name == "weight":
@@ -747,7 +798,10 @@ class BlockRegistry:
                 converted_params += 1
 
                 if drop_module_tensors:
-                    self._drop_param_storage(module, param_name, param)
+                    with torch.no_grad():
+                        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                        if param.grad is not None:
+                            param.grad = None
 
             if squareq_specs:
                 new_entry = replace(
@@ -765,6 +819,193 @@ class BlockRegistry:
 
         self._entries = new_entries
         return converted_params
+
+    @staticmethod
+    def _load_v2_manifest(
+        manifest_path: Path,
+    ) -> dict[str, tuple[int, int, int, bool]]:
+        """Load V2 JSON manifest and return layer metadata.
+
+        Returns a mapping:
+            canonical_name -> (out_features, in_features, padded_in_features, has_bias)
+        """
+        raw = json.loads(manifest_path.read_text())
+        result: dict[str, tuple[int, int, int, bool]] = {}
+        for entry in raw.get("layers", []):
+            name = entry.get("canonical_name", "")
+            if not name:
+                continue
+            orig_shape = entry.get("orig_shape", [0, 0])
+            packed_shape = entry.get("packed_shape", [0, 0])
+            out_features = int(orig_shape[0]) if len(orig_shape) > 0 else 0
+            in_features = int(orig_shape[1]) if len(orig_shape) > 1 else 0
+            padded_in = int(packed_shape[1]) if len(packed_shape) > 1 else in_features
+            has_bias = entry.get("bias_key") is not None
+            if out_features <= 0 or in_features <= 0:
+                continue
+            result[name] = (out_features, in_features, padded_in, has_bias)
+        return result
+
+    def convert_to_squareq_v2_backed(
+        self,
+        safetensors_path: str | Path,
+        manifest_path: str | Path,
+        *,
+        drop_module_tensors: bool = True,
+    ) -> int:
+        """Convert eligible block params to SquareQ V2 (safetensors)-backed descriptors.
+
+        V2 uses a safetensors slab + JSON manifest sidecar instead of
+        the old .fpk torch.save format.
+
+        Returns the number of parameters converted.
+        """
+        if not self._frozen:
+            raise RuntimeError(
+                "convert_to_squareq_v2_backed requires a validated (frozen) registry"
+            )
+
+        st_path = Path(safetensors_path).expanduser()
+        mf_path = Path(manifest_path).expanduser()
+        if not st_path.exists():
+            raise FileNotFoundError(f"V2 safetensors file not found: {st_path}")
+        if not mf_path.exists():
+            raise FileNotFoundError(f"V2 manifest file not found: {mf_path}")
+
+        layer_meta = self._load_v2_manifest(mf_path)
+        converted_params = 0
+        new_entries: OrderedDict[str, BlockEntry] = OrderedDict()
+
+        for block_id, entry in self._entries.items():
+            module = entry.module_ref()
+            if module is None:
+                new_entries[block_id] = entry
+                continue
+
+            layout: list[ParamLayoutEntry] = []
+            squareq_specs: list[SquareQParamSpec] = []
+            module_param_names: list[str] = []
+            offset = 0
+
+            for param_name, param in module.named_parameters():
+                shape = tuple(int(dim) for dim in param.shape)
+                numel = int(param.numel())
+                nbytes = numel * entry.dtype.itemsize
+                layout.append((param_name, shape, entry.dtype, offset, numel))
+                offset += nbytes
+
+                if param.requires_grad:
+                    module_param_names.append(param_name)
+                    continue
+                if _should_keep_module_param_resident(module, param_name, param):
+                    module_param_names.append(param_name)
+                    continue
+
+                kind: str | None = None
+                if param_name.endswith(".weight") or param_name == "weight":
+                    kind = "weight"
+                elif param_name.endswith(".bias") or param_name == "bias":
+                    kind = "bias"
+                if kind is None:
+                    module_param_names.append(param_name)
+                    continue
+
+                matched_layer: str | None = None
+                matched_meta: tuple[int, int, int, bool] | None = None
+                for layer_name in self._candidate_squareq_layer_keys(block_id, param_name):
+                    meta = layer_meta.get(layer_name)
+                    if meta is not None:
+                        matched_layer = layer_name
+                        matched_meta = meta
+                        break
+                if matched_layer is None or matched_meta is None:
+                    module_param_names.append(param_name)
+                    continue
+
+                out_features, in_features, padded_in_features, has_bias = matched_meta
+                if kind == "weight":
+                    if len(shape) == 0:
+                        module_param_names.append(param_name)
+                        continue
+                    out_dim = int(shape[0])
+                    in_flat = int(numel // max(out_dim, 1))
+                    if (
+                        out_dim != out_features
+                        or in_flat != in_features
+                        or out_dim <= 0
+                        or in_flat <= 0
+                    ):
+                        module_param_names.append(param_name)
+                        continue
+                else:
+                    if not has_bias or numel != out_features:
+                        module_param_names.append(param_name)
+                        continue
+
+                squareq_specs.append(
+                    SquareQParamSpec(
+                        param_name=param_name,
+                        layer_name=matched_layer,
+                        kind=kind,
+                        out_features=out_features,
+                        in_features=in_features,
+                        padded_in_features=padded_in_features,
+                    )
+                )
+                converted_params += 1
+
+                if drop_module_tensors:
+                    with torch.no_grad():
+                        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+                        if param.grad is not None:
+                            param.grad = None
+
+            if squareq_specs:
+                new_entry = replace(
+                    entry,
+                    source_path=str(st_path),
+                    source_format="squareq_v2",
+                    param_layout=tuple(layout),
+                    file_param_specs=tuple(),
+                    squareq_param_specs=tuple(squareq_specs),
+                    module_param_names=tuple(module_param_names),
+                )
+                new_entries[block_id] = new_entry
+            else:
+                new_entries[block_id] = entry
+
+        self._entries = new_entries
+        return converted_params
+
+    def mark_eriquant_backed(
+        self,
+        block_ids: list[str],
+        qtype_name: str,
+        frozen_sizes: dict[str, int] | None = None,
+    ) -> None:
+        """Mark blocks as eriquant-backed and optionally update their size_bytes.
+
+        Parameters
+        ----------
+        block_ids:
+            Block IDs to mark.
+        qtype_name:
+            EriQuant qtype name (e.g. "qint8").
+        frozen_sizes:
+            Optional mapping of block_id -> frozen size in bytes.
+            If provided, updates size_bytes to the smaller quantized size.
+        """
+        for block_id in block_ids:
+            if block_id not in self._entries:
+                continue
+            entry = self._entries[block_id]
+            kwargs: dict[str, object] = {
+                "quant_format": "eriquant",
+                "eriquant_qtype": qtype_name,
+            }
+            if frozen_sizes is not None and block_id in frozen_sizes:
+                kwargs["size_bytes"] = frozen_sizes[block_id]
+            self._entries[block_id] = replace(entry, **kwargs)
 
     def build_from_module_list(
         self,

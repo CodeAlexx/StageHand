@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from stagehand.pool import PinnedSlab
     from stagehand.registry import BlockRegistry
 
-__all__ = ["BlockState", "ResidencyEntry", "ResidencyMap", "ResidentPriority"]
+__all__ = ["BlockState", "ResidencyEntry", "ResidencyMap"]
 
 
 # ── state machine ────────────────────────────────────────────────────────
@@ -39,14 +39,6 @@ class BlockState(str, Enum):
     GPU_READY = "gpu_ready"
     EVICTING = "evicting"
     GPU_FREEING = "gpu_freeing"
-
-
-class ResidentPriority(Enum):
-    """Priority level for residency protection."""
-
-    PRIMARY = "primary"     # Protected resident — eviction suppressed, budget reserved
-    GUEST = "guest"         # Short-lived, evaluated against remaining headroom only
-    NORMAL = "normal"       # Default: standard LRU eviction rules apply
 
 
 # Legal state transitions (source -> set of allowed destinations).
@@ -96,7 +88,6 @@ class ResidencyMap:
         self._entries: dict[str, ResidencyEntry] = {}
         for entry in registry.blocks_in_order():
             self._entries[entry.block_id] = ResidencyEntry()
-        self._protected_blocks: set[str] = set()
 
     # ── state queries ────────────────────────────────────────────────
 
@@ -142,30 +133,12 @@ class ResidencyMap:
             raise ValueError(f"Refcount for {block_id!r} is already {entry.refcount}")
         entry.refcount -= 1
 
-    # ── protection ────────────────────────────────────────────────────
-
-    def protect_blocks(self, block_ids: frozenset[str] | set[str]) -> None:
-        """Mark blocks as protected from eviction."""
-        self._protected_blocks.update(block_ids)
-
-    def unprotect_blocks(self, block_ids: frozenset[str] | set[str]) -> None:
-        """Remove eviction protection from blocks."""
-        self._protected_blocks.difference_update(block_ids)
-
-    def is_protected(self, block_id: str) -> bool:
-        """True if *block_id* is protected from eviction."""
-        return block_id in self._protected_blocks
-
     # ── eviction helpers ─────────────────────────────────────────────
 
     def can_evict(self, block_id: str) -> bool:
-        """True if *block_id* is GPU_READY with refcount == 0 and not protected."""
+        """True if *block_id* is GPU_READY with refcount == 0."""
         entry = self._entries[block_id]
-        return (
-            entry.state == BlockState.GPU_READY
-            and entry.refcount == 0
-            and block_id not in self._protected_blocks
-        )
+        return entry.state == BlockState.GPU_READY and entry.refcount == 0
 
     def gpu_resident_blocks(self) -> list[str]:
         """All block_ids currently in GPU_READY state."""
@@ -182,8 +155,8 @@ class ResidencyMap:
     ) -> list[tuple[str, ResidencyEntry]]:
         """Blocks eligible for eviction.
 
-        Returns blocks that are GPU_READY, have refcount == 0, not protected,
-        and whose ``last_used_step`` is older than *current_step* - *cooldown_steps*.
+        Returns blocks that are GPU_READY, have refcount == 0, and whose
+        ``last_used_step`` is older than *current_step* - *cooldown_steps*.
         Results are returned in no particular order; the caller (scheduler)
         is responsible for scoring and sorting.
         """
@@ -193,26 +166,9 @@ class ResidencyMap:
             if (
                 entry.state == BlockState.GPU_READY
                 and entry.refcount == 0
-                and bid not in self._protected_blocks
                 and entry.last_used_step <= threshold
             ):
                 candidates.append((bid, entry))
-        return candidates
-
-    def protected_eviction_candidates(self) -> list[tuple[str, ResidencyEntry]]:
-        """Protected blocks that could be evicted as a last resort.
-
-        Returns protected blocks that are GPU_READY with refcount == 0,
-        sorted by last_used_step (LRU first).
-        """
-        candidates: list[tuple[str, ResidencyEntry]] = []
-        for bid in self._protected_blocks:
-            if bid not in self._entries:
-                continue
-            entry = self._entries[bid]
-            if entry.state == BlockState.GPU_READY and entry.refcount == 0:
-                candidates.append((bid, entry))
-        candidates.sort(key=lambda x: x[1].last_used_step)
         return candidates
 
     def __len__(self) -> int:

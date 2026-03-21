@@ -28,6 +28,15 @@ if TYPE_CHECKING:
     from stagehand.residency import ResidencyEntry, ResidencyMap
     from stagehand.telemetry import StagehandTelemetry
     from stagehand.transfer import AsyncTransferEngine, TransferHandle
+    try:
+        from serenity.memory.adapters.stagehand_conductor import StagehandConductorAdapter
+        from serenity.memory.adapters.squareq_conductor import SquareQConductorAdapter
+    except ImportError:
+        pass
+    try:
+        from eriquant.stagehand.adapter import StagehandAdapter as EriQuantAdapter
+    except ImportError:
+        pass
 
 __all__ = ["StaticLookaheadPolicy", "StagehandScheduler"]
 
@@ -150,19 +159,14 @@ def _build_param_layout(
 
     Returns a list of ``(param_name, shape, dtype, offset_bytes, num_elements)``
     tuples describing how each parameter is packed into a flat buffer.
-
-    Each parameter uses its **actual** dtype (not the passed *dtype*) so that
-    mixed-precision models (e.g. FP8 weights + bf16 biases) are laid out
-    correctly without unwanted casting.
     """
     layout: list[tuple[str, tuple[int, ...], torch.dtype, int, int]] = []
     offset = 0
     for name, param in module.named_parameters():
-        p_dtype = param.dtype
         numel = param.numel()
-        elem_size = p_dtype.itemsize
+        elem_size = dtype.itemsize
         nbytes = numel * elem_size
-        layout.append((name, tuple(param.shape), p_dtype, offset, numel))
+        layout.append((name, tuple(param.shape), dtype, offset, numel))
         offset += nbytes
     return layout
 
@@ -172,11 +176,7 @@ def _flatten_params_into_buffer(
     buffer: torch.Tensor,
     layout: list[tuple[str, tuple[int, ...], torch.dtype, int, int]],
 ) -> None:
-    """Copy module parameters into a uint8 *buffer* according to *layout*.
-
-    Parameters are copied at their **actual** dtype (recorded in the layout)
-    without casting, so mixed-precision models are preserved faithfully.
-    """
+    """Copy module parameters into a uint8 *buffer* according to *layout*."""
     params = dict(module.named_parameters())
     for name, _shape, dtype, offset_bytes, numel in layout:
         param = params[name]
@@ -184,7 +184,7 @@ def _flatten_params_into_buffer(
         nbytes = numel * elem_size
         # Get a typed view into the buffer region.
         region = buffer[offset_bytes : offset_bytes + nbytes].view(dtype)
-        region.copy_(param.data.reshape(-1))
+        region.copy_(param.data.to(dtype).reshape(-1))
 
 
 def _copy_file_backed_params_into_buffer(
@@ -193,8 +193,10 @@ def _copy_file_backed_params_into_buffer(
     layout: list[tuple[str, tuple[int, ...], torch.dtype, int, int]],
     file_specs: dict[str, FileParamSpec],
     module_param_names: set[str],
+    source_path: str,
     file_view: memoryview,
     get_file_view: Any = None,
+    get_file_tensor_view: Any = None,
 ) -> None:
     """Populate slab buffer from a hybrid file/module parameter source.
 
@@ -213,31 +215,36 @@ def _copy_file_backed_params_into_buffer(
         if spec is not None:
             # Use per-spec file path for sharded models, else the block-level view
             if spec.file_path and get_file_view is not None:
+                resolved_source_path = spec.file_path
                 view = get_file_view(spec.file_path)
             else:
+                resolved_source_path = source_path
                 view = file_view
-            src_begin = int(spec.file_offset)
-            src_end = src_begin + int(spec.source_nbytes)
-            src_view = view[src_begin:src_end]
+            if get_file_tensor_view is not None:
+                src_typed = get_file_tensor_view(resolved_source_path, spec, view)
+            else:
+                src_begin = int(spec.file_offset)
+                src_end = src_begin + int(spec.source_nbytes)
+                src_view = view[src_begin:src_end]
+                src_typed = torch.frombuffer(src_view, dtype=spec.source_dtype).reshape(spec.source_shape)
             if spec.source_dtype == dtype:
-                src_bytes = torch.frombuffer(src_view, dtype=torch.uint8)
-                dst_region.copy_(src_bytes)
+                dst_region.view(dtype).copy_(src_typed.reshape(-1))
             else:
                 # Source dtype differs from runtime block dtype (e.g. F16 file
-                # with BF16 runtime). Decode + cast per parameter.
-                src_typed = torch.frombuffer(src_view, dtype=spec.source_dtype).reshape(spec.source_shape)
-                cast = src_typed.to(dtype=dtype)
-                dst_region.copy_(cast.view(torch.uint8).reshape(-1))
+                # with BF16 runtime). Cast directly into the destination view so
+                # we avoid materializing a second large CPU tensor per parameter.
+                dst_region.view(dtype).copy_(src_typed.reshape(-1))
             continue
 
         if name in module_param_names and name in params:
             param = params[name]
-            dst_region.view(dtype).copy_(param.data.to(dtype).reshape(-1))
-            continue
+            if param.data.numel() == numel:
+                dst_region.view(dtype).copy_(param.data.to(dtype).reshape(-1))
+                continue
+            # Param was evicted (size-0 data) — fall through to zero fill.
 
-        # Fallback for missing params: zero fill to keep layout deterministic.
+        # Fallback for missing/evicted params: zero fill to keep layout deterministic.
         dst_region.zero_()
-
 
 def _copy_squareq_backed_params_into_buffer(
     module: nn.Module | None,
@@ -246,8 +253,17 @@ def _copy_squareq_backed_params_into_buffer(
     squareq_specs: dict[str, SquareQParamSpec],
     module_param_names: set[str],
     squareq_layers: dict[str, Any],
+    module_param_cache: dict[str, torch.Tensor] | None = None,
 ) -> None:
-    """Populate slab buffer from a SquareQ BP8 slab + mutable module params."""
+    """Populate slab buffer from a SquareQ BP8 slab + mutable module params.
+
+    Parameters
+    ----------
+    module_param_cache:
+        Optional dict that caches non-SquareQ module param data on CPU.
+        On first call, params are stored here. On subsequent calls (after
+        eviction empties param data), cached values are used instead.
+    """
     params = dict(module.named_parameters()) if module is not None else {}
 
     for name, shape, dtype, offset_bytes, numel in layout:
@@ -263,8 +279,6 @@ def _copy_squareq_backed_params_into_buffer(
                     qweight = layer.get("qweight")
                     scale = layer.get("scale")
                     zero_point = layer.get("zero_point")
-                    if zero_point is None:
-                        zero_point = layer.get("zero")
                     if (
                         isinstance(qweight, torch.Tensor)
                         and isinstance(scale, torch.Tensor)
@@ -301,10 +315,19 @@ def _copy_squareq_backed_params_into_buffer(
 
         if name in module_param_names and name in params:
             param = params[name]
-            dst_region.view(dtype).copy_(param.data.to(dtype).reshape(-1))
-            continue
+            if param.data.numel() == numel:
+                dst_region.view(dtype).copy_(param.data.to(dtype).reshape(-1))
+                # Cache on CPU for after eviction
+                if module_param_cache is not None and name not in module_param_cache:
+                    module_param_cache[name] = param.data.detach().cpu()
+                continue
+            # Param was evicted (size-0 data) — try cache
+            if module_param_cache is not None and name in module_param_cache:
+                cached = module_param_cache[name]
+                dst_region.view(dtype).copy_(cached.to(dtype).reshape(-1))
+                continue
 
-        # Fallback for missing params: zero fill to keep layout deterministic.
+        # Fallback for missing/evicted params: zero fill to keep layout deterministic.
         dst_region.zero_()
 
 
@@ -329,6 +352,44 @@ def _restore_params_from_tensor(
         _set_param_data(module, name, view)
 
 
+def _restore_file_backed_param_to_cpu_view(
+    module: nn.Module,
+    dotted_name: str,
+    spec: FileParamSpec,
+    *,
+    source_path: str,
+    runtime_dtype: torch.dtype,
+    base_file_view: memoryview | None,
+    get_file_view: Any = None,
+    get_file_tensor_view: Any = None,
+) -> bool:
+    """Restore a frozen file-backed parameter as a CPU tensor view.
+
+    This keeps the original shape available during backward-phase eviction
+    without materializing a private CPU clone of the parameter data.
+    """
+    if spec.file_path and get_file_view is not None:
+        resolved_source_path = spec.file_path
+        file_view = get_file_view(spec.file_path)
+    else:
+        resolved_source_path = source_path
+        file_view = base_file_view
+    if file_view is None:
+        return False
+
+    if get_file_tensor_view is not None:
+        src_typed = get_file_tensor_view(resolved_source_path, spec, file_view)
+    else:
+        src_begin = int(spec.file_offset)
+        src_end = src_begin + int(spec.source_nbytes)
+        src_view = file_view[src_begin:src_end]
+        src_typed = torch.frombuffer(src_view, dtype=spec.source_dtype).reshape(spec.source_shape)
+    if spec.source_dtype != runtime_dtype:
+        src_typed = src_typed.to(dtype=runtime_dtype)
+    _set_param_data(module, dotted_name, src_typed)
+    return True
+
+
 def _get_param_data(module: nn.Module, dotted_name: str) -> torch.Tensor:
     """Return ``module.<dotted_name>.data`` following dot-separated path."""
     parts = dotted_name.split(".")
@@ -345,7 +406,13 @@ def _set_param_data(module: nn.Module, dotted_name: str, data: torch.Tensor) -> 
     for part in parts[:-1]:
         current = getattr(current, part)
     param = getattr(current, parts[-1])
-    param.data = data
+    try:
+        param.data = data
+    except RuntimeError:
+        # Tensor type mismatch (e.g. meta-device param receiving CUDA data).
+        # Replace the parameter entirely.
+        new_param = nn.Parameter(data, requires_grad=param.requires_grad)
+        setattr(current, parts[-1], new_param)
 
 
 def _detach_params(
@@ -387,9 +454,8 @@ class StagehandScheduler:
     config:
         Runtime configuration.
     inference_mode:
-        If *True*, eviction skips save-back only for file-backed/squareq-backed
-        blocks (immutable weights are reloaded from disk). Module-backed blocks
-        still save back to avoid detached-empty parameter tensors on reload.
+        If *True*, eviction always uses ``save_back=False`` (frozen blocks,
+        no gradients to preserve).
     """
 
     def __init__(
@@ -416,6 +482,8 @@ class StagehandScheduler:
 
         self._current_step: int = 0
         self._cursor: int = 0
+        self._backward_phase: bool = False
+        self._defer_backward_eviction: bool = False
 
         # Ordered list of block entries for exec_order lookup.
         self._ordered_blocks: list[BlockEntry] = []
@@ -425,10 +493,24 @@ class StagehandScheduler:
 
         # Track pending transfer handles per block.
         self._pending_handles: dict[str, TransferHandle] = {}
+
+        # Conductor bandwidth adapter plumbing (Phase F).
+        self._conductor_adapter: StagehandConductorAdapter | None = None
+        self._squareq_adapter: SquareQConductorAdapter | None = None
+        self._eriquant_adapter: EriQuantAdapter | None = None
+        self._pending_bw_tokens: dict[str, tuple[Any, float]] = {}  # block_id -> (token, t0)
+
         # Opened safetensors mmaps keyed by absolute path.
         self._file_maps: dict[str, tuple[object, mmap.mmap, memoryview]] = {}
+        # Cached typed tensor views over mmap-backed safetensors regions.
+        self._file_tensor_views: dict[
+            tuple[str, int, int, torch.dtype, tuple[int, ...]],
+            torch.Tensor,
+        ] = {}
         # Loaded SquareQ slab layer dictionaries keyed by absolute path.
         self._squareq_layers: dict[str, dict[str, Any]] = {}
+        # Per-block cache for non-SquareQ module params (survives eviction).
+        self._module_param_caches: dict[str, dict[str, torch.Tensor]] = {}
 
     # ── step lifecycle ────────────────────────────────────────────────
 
@@ -444,13 +526,27 @@ class StagehandScheduler:
         """Initialize state for a new training step."""
         self._current_step = step
         self._cursor = 0
+        self._backward_phase = False
         self._telemetry.begin_step(step)
 
     def end_step(self) -> None:
         """Finalize the current step — reap transfers, update telemetry."""
+        self._backward_phase = False
         self._engine.reap()
         self._reconcile_file_backed_grads()
         self._telemetry.end_step()
+
+    def enter_backward_phase(self) -> None:
+        """Mark scheduler callbacks as running from backward hooks."""
+        self._backward_phase = True
+
+    def exit_backward_phase(self) -> None:
+        """Leave backward-hook phase tracking."""
+        self._backward_phase = False
+
+    def set_defer_backward_eviction(self, enabled: bool) -> None:
+        """Delay eager post-block eviction until the next pre-block pass."""
+        self._defer_backward_eviction = enabled
 
     def _reconcile_file_backed_grads(self) -> None:
         """Ensure CPU-resident mutable params have CPU grads at step boundary."""
@@ -483,6 +579,33 @@ class StagehandScheduler:
         self._file_maps[key] = (handle, mm, view)
         return view
 
+    def _get_file_tensor_view(
+        self,
+        source_path: str,
+        spec: FileParamSpec,
+        file_view: memoryview | None = None,
+    ) -> torch.Tensor:
+        """Return a cached typed tensor view over a safetensors parameter region."""
+        resolved_path = str(Path(source_path).expanduser())
+        key = (
+            resolved_path,
+            int(spec.file_offset),
+            int(spec.source_nbytes),
+            spec.source_dtype,
+            spec.source_shape,
+        )
+        cached = self._file_tensor_views.get(key)
+        if cached is not None:
+            return cached
+
+        view = file_view if file_view is not None else self._get_file_view(resolved_path)
+        src_begin = int(spec.file_offset)
+        src_end = src_begin + int(spec.source_nbytes)
+        src_view = view[src_begin:src_end]
+        typed = torch.frombuffer(src_view, dtype=spec.source_dtype).reshape(spec.source_shape)
+        self._file_tensor_views[key] = typed
+        return typed
+
     def _get_squareq_layers(self, source_path: str) -> dict[str, Any]:
         key = str(Path(source_path).expanduser())
         cached = self._squareq_layers.get(key)
@@ -511,18 +634,32 @@ class StagehandScheduler:
         self._squareq_layers[key] = layers
         return layers
 
-    def protect_blocks(self, block_ids: frozenset[str] | set[str]) -> None:
-        """Mark blocks as protected from eviction."""
-        self._residency.protect_blocks(block_ids)
-        log.debug("Scheduler: protecting %d blocks", len(block_ids))
+    def _get_squareq_v2_layers(self, source_path: str) -> dict[str, Any]:
+        """Load V2 SquareQ layers from safetensors + JSON manifest sidecar.
 
-    def unprotect_blocks(self, block_ids: frozenset[str] | set[str]) -> None:
-        """Remove eviction protection from blocks."""
-        self._residency.unprotect_blocks(block_ids)
-        log.debug("Scheduler: unprotected %d blocks", len(block_ids))
+        Derives the manifest path from the safetensors path
+        (``foo.safetensors`` → ``foo.manifest.json``) and delegates to
+        ``get_squareq_v2_layers``.  Results are cached in
+        ``_squareq_layers`` keyed by absolute path.
+        """
+        key = str(Path(source_path).expanduser())
+        cached = self._squareq_layers.get(key)
+        if cached is not None:
+            return cached
+
+        manifest_path = str(Path(key).with_suffix(".manifest.json"))
+        try:
+            from serenity.squareq.stagehand import get_squareq_v2_layers
+        except ImportError:
+            from squareq.bridge import get_squareq_v2_layers  # standalone fallback
+
+        layers = get_squareq_v2_layers(key, manifest_path)
+        self._squareq_layers[key] = layers
+        return layers
 
     def close(self) -> None:
         """Release open file-backed mmap resources."""
+        self._file_tensor_views.clear()
         for handle, mm, view in self._file_maps.values():
             try:
                 view.release()
@@ -538,6 +675,107 @@ class StagehandScheduler:
                 pass
         self._file_maps.clear()
         self._squareq_layers.clear()
+        self._module_param_caches.clear()
+
+    # ── conductor bandwidth adapter plumbing (Phase F) ──────────────
+
+    def set_conductor_adapter(self, adapter: StagehandConductorAdapter) -> None:
+        """Set the Stagehand conductor adapter for bandwidth-aware scheduling."""
+        self._conductor_adapter = adapter
+
+    def set_squareq_adapter(self, adapter: SquareQConductorAdapter) -> None:
+        """Set the SquareQ conductor adapter for bandwidth-aware scheduling."""
+        self._squareq_adapter = adapter
+
+    def set_eriquant_adapter(self, adapter: EriQuantAdapter) -> None:
+        """Register an EriQuant StagehandAdapter for quantized block management."""
+        self._eriquant_adapter = adapter
+
+    def _acquire_bw_token(
+        self, block_id: str, estimated_bytes: int, speculative: bool = False,
+    ) -> bool:
+        """Acquire a bandwidth token for a block transfer.
+
+        Returns True if the transfer should proceed, False if it should be
+        skipped (only possible for speculative prefetches).
+        """
+        if self._conductor_adapter is None:
+            return True
+
+        try:
+            # Route to SquareQ adapter for squareq-backed blocks.
+            block_entry = self._registry.get(block_id)
+            if block_entry.squareq_backed and self._squareq_adapter is not None:
+                if speculative:
+                    result = self._squareq_adapter.request_lookahead(
+                        estimated_bytes=estimated_bytes,
+                        block_id=block_id,
+                        step_id=self._current_step,
+                    )
+                else:
+                    result = self._squareq_adapter.request_slab_load(
+                        estimated_bytes=estimated_bytes,
+                        block_id=block_id,
+                        step_id=self._current_step,
+                    )
+            else:
+                if speculative:
+                    result = self._conductor_adapter.request_prefetch(
+                        block_id=block_id,
+                        estimated_bytes=estimated_bytes,
+                        step_id=self._current_step,
+                    )
+                else:
+                    result = self._conductor_adapter.request_block_load(
+                        block_id=block_id,
+                        estimated_bytes=estimated_bytes,
+                        step_id=self._current_step,
+                    )
+
+            if result is None:
+                # Bandwidth scheduling disabled in adapter — proceed.
+                return True
+
+            from serenity.memory.conductor.bandwidth import AcquireStatus  # type: ignore[import-not-found]
+            if result.status == AcquireStatus.ACQUIRED and result.token is not None:
+                self._pending_bw_tokens[block_id] = (result.token, time.monotonic())
+                return True
+
+            # Non-ACQUIRED: skip speculative, proceed for required.
+            if speculative:
+                return False
+            log.debug(
+                "Bandwidth non-ACQUIRED for required block %s (status=%s), proceeding",
+                block_id, result.status.value,
+            )
+            return True
+
+        except Exception:
+            log.warning(
+                "Bandwidth token acquire failed for block %s, proceeding",
+                block_id, exc_info=True,
+            )
+            return True
+
+    def _complete_bw_token(self, block_id: str, actual_bytes: int) -> None:
+        """Complete a bandwidth token after a transfer finishes."""
+        pending = self._pending_bw_tokens.pop(block_id, None)
+        if pending is None:
+            return
+
+        token, t0 = pending
+        duration_ms = (time.monotonic() - t0) * 1000.0
+
+        try:
+            conductor = self._conductor_adapter._conductor
+            if conductor is not None and conductor.transfer is not None:
+                conductor.transfer.complete_transfer(token, actual_bytes, duration_ms)
+                conductor.transfer.release_token(token)
+        except Exception:
+            log.warning(
+                "Bandwidth token completion failed for block %s",
+                block_id, exc_info=True,
+            )
 
     # ── per-block hooks ───────────────────────────────────────────────
 
@@ -614,7 +852,10 @@ class StagehandScheduler:
         # of accumulating all blocks on GPU until the watermark is hit.
         # ignore_cooldown=True: within a step, completed blocks (refcount 0)
         # should be evictable immediately — cooldown is for cross-step thrashing.
-        if self._budget.above_high_watermark():
+        if (
+            self._budget.above_high_watermark()
+            and not (self._backward_phase and self._defer_backward_eviction)
+        ):
             self._run_eviction(ignore_cooldown=True)
 
     # ── prefetch logic ────────────────────────────────────────────────
@@ -648,9 +889,9 @@ class StagehandScheduler:
             if not self._budget.can_prefetch():
                 break
 
-            self._load_block_to_gpu(block_id)
+            self._load_block_to_gpu(block_id, speculative=True)
 
-    def _load_block_to_gpu(self, block_id: str) -> None:
+    def _load_block_to_gpu(self, block_id: str, speculative: bool = False) -> None:
         """Ensure block progresses toward GPU_READY."""
         state = self._residency.get_state(block_id)
 
@@ -660,15 +901,36 @@ class StagehandScheduler:
             return
 
         block_entry = self._registry.get(block_id)
+
+        # Bandwidth gate: acquire token before any transfer.
+        if not self._acquire_bw_token(block_id, block_entry.size_bytes, speculative):
+            return  # Speculative prefetch denied — skip.
         res_entry = self._residency.get_entry(block_id)
 
-        # Module-backed blocks larger than one slab: params live on the module
+        # EriQuant-backed blocks: delegate to the EriQuant adapter which
+        # manages frozen quantized weights.  The adapter's on_prefetch()
+        # calls module.to(device) on the frozen (smaller) representation.
+        if block_entry.eriquant_backed:
+            if self._eriquant_adapter is None:
+                log.error("Block %r is eriquant-backed but no adapter set — skipping", block_id)
+                return
+            if state == BlockState.UNLOADED:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                self._eriquant_adapter.on_prefetch(block_id, device)
+                # Walk through valid state transitions for residency tracking.
+                self._residency.transition(block_id, BlockState.HOST_STAGED)
+                self._residency.transition(block_id, BlockState.PREFETCHING)
+                self._residency.transition(block_id, BlockState.GPU_READY)
+                self._telemetry.record_h2d(block_entry.size_bytes)
+                self._complete_bw_token(block_id, block_entry.size_bytes)
+            return
+
+        # Module-backed blocks (not file/squareq): params live on the module
         # itself (on CPU after eviction).  Move directly to GPU without going
-        # through the pinned-slab pipeline, which returns a list of slabs for
-        # oversized blocks and breaks submit_h2d.
-        is_module_backed = not block_entry.file_backed and not block_entry.squareq_backed
-        slab_bytes = self._engine._pool._slab_bytes if hasattr(self._engine._pool, "_slab_bytes") else float("inf")
-        if is_module_backed and state == BlockState.UNLOADED and block_entry.size_bytes > slab_bytes:
+        # through the pinned-slab pipeline, which can't handle blocks larger
+        # than a single slab for module-backed data.
+        is_module_backed = not block_entry.file_backed and not block_entry.squareq_backed and not block_entry.eriquant_backed
+        if is_module_backed and state == BlockState.UNLOADED:
             self._load_module_backed_direct(block_id, block_entry, res_entry)
             return
 
@@ -679,14 +941,12 @@ class StagehandScheduler:
             state = self._residency.get_state(block_id)  # now HOST_STAGED
 
         if state == BlockState.HOST_STAGED:
-            # Allocate GPU tensor if needed.  Use uint8 as a raw byte buffer
-            # so that mixed-precision blocks (e.g. FP8 + bf16 params) get the
-            # correct total allocation size.  The tensor is viewed as uint8
-            # during param restoration anyway.
+            # Allocate GPU tensor if needed.
             if res_entry.gpu_tensor is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
+                numel = block_entry.size_bytes // block_entry.dtype.itemsize
                 res_entry.gpu_tensor = torch.empty(
-                    block_entry.size_bytes, dtype=torch.uint8, device=device
+                    numel, dtype=block_entry.dtype, device=device
                 )
 
             # Submit H2D transfer.
@@ -719,7 +979,12 @@ class StagehandScheduler:
                 if not isinstance(slab, list):
                     squareq_specs = {spec.param_name: spec for spec in block_entry.squareq_param_specs}
                     module_param_names = set(block_entry.module_param_names)
-                    squareq_layers = self._get_squareq_layers(str(block_entry.source_path))
+                    if block_entry.source_format == "squareq_v2":
+                        squareq_layers = self._get_squareq_v2_layers(str(block_entry.source_path))
+                    else:
+                        squareq_layers = self._get_squareq_layers(str(block_entry.source_path))
+                    # Per-block cache for non-SquareQ module params that survive eviction
+                    block_cache = self._module_param_caches.setdefault(block_entry.block_id, {})
                     _copy_squareq_backed_params_into_buffer(
                         module=module,
                         buffer=slab.buffer,
@@ -727,6 +992,7 @@ class StagehandScheduler:
                         squareq_specs=squareq_specs,
                         module_param_names=module_param_names,
                         squareq_layers=squareq_layers,
+                        module_param_cache=block_cache,
                     )
             elif block_entry.file_backed:
                 layout = list(block_entry.param_layout)
@@ -748,8 +1014,10 @@ class StagehandScheduler:
                         layout=layout,
                         file_specs=file_specs,
                         module_param_names=module_param_names,
+                        source_path=str(block_entry.source_path),
                         file_view=file_view,
                         get_file_view=self._get_file_view if is_sharded else None,
+                        get_file_tensor_view=self._get_file_tensor_view,
                     )
             elif any(True for _ in module.parameters()):
                 layout = _build_param_layout(module, block_entry.dtype)
@@ -796,8 +1064,9 @@ class StagehandScheduler:
         layout = _build_param_layout(module, block_entry.dtype)
         res_entry.param_layout = layout
 
-        # Allocate contiguous GPU buffer as raw bytes (tracked by VRAM budget).
-        gpu_tensor = torch.empty(block_entry.size_bytes, dtype=torch.uint8, device=device)
+        # Allocate contiguous GPU buffer (tracked by VRAM budget).
+        numel = block_entry.size_bytes // block_entry.dtype.itemsize
+        gpu_tensor = torch.empty(numel, dtype=block_entry.dtype, device=device)
         res_entry.gpu_tensor = gpu_tensor
 
         # Flatten CPU params directly into the GPU tensor.
@@ -808,7 +1077,7 @@ class StagehandScheduler:
             elem_size = dtype.itemsize
             nbytes = param_numel * elem_size
             region = gpu_bytes[offset_bytes : offset_bytes + nbytes].view(dtype)
-            region.copy_(param.data.reshape(-1))
+            region.copy_(param.data.to(dtype).reshape(-1))
 
         # Restore module params as views into the contiguous GPU tensor.
         _restore_params_from_tensor(module, gpu_bytes, layout)
@@ -824,6 +1093,8 @@ class StagehandScheduler:
         self._residency.transition(block_id, BlockState.PREFETCHING)
         self._residency.transition(block_id, BlockState.GPU_READY)
         self._telemetry.record_h2d(block_entry.size_bytes)
+        self._complete_bw_token(block_id, block_entry.size_bytes)
+
 
     def _finalize_gpu_load(self, block_id: str) -> None:
         """After H2D transfer completes, restore module params from GPU tensor.
@@ -836,6 +1107,7 @@ class StagehandScheduler:
         """
         self._residency.transition(block_id, BlockState.GPU_READY)
         block_entry = self._registry.get(block_id)
+        self._complete_bw_token(block_id, block_entry.size_bytes)
         res_entry = self._residency.get_entry(block_id)
 
         if res_entry.param_layout is not None and res_entry.gpu_tensor is not None:
@@ -913,35 +1185,10 @@ class StagehandScheduler:
         for _score, bid in scored:
             if self._budget.below_low_watermark():
                 break
-            # In inference mode, file-backed/squareq-backed blocks can skip
-            # save-back because immutable base weights are reloaded from disk.
-            # Module-backed blocks must save back or params become detached
-            # empty tensors and cannot be reconstructed on reload.
-            entry = self._registry.get(bid)
-            save_back = (not self._inference_mode) or (
-                not entry.file_backed and not entry.squareq_backed
-            )
+            # In inference mode, never save back (blocks are frozen).
+            save_back = not self._inference_mode
             self._evict_block(bid, save_back=save_back)
             self._telemetry.record_eviction()
-
-        # Last-resort fallback: if still above high watermark and NO normal
-        # candidates remain, evict LRU protected blocks rather than deadlocking.
-        if not self._budget.below_low_watermark() and self._budget.above_high_watermark():
-            protected = self._residency.protected_eviction_candidates()
-            for bid, _entry in protected:
-                if self._budget.below_low_watermark():
-                    break
-                log.warning(
-                    "keep_resident: forced to evict protected block %s "
-                    "due to critical VRAM pressure. No other candidates available.",
-                    bid,
-                )
-                entry = self._registry.get(bid)
-                save_back = (not self._inference_mode) or (
-                    not entry.file_backed and not entry.squareq_backed
-                )
-                self._evict_block(bid, save_back=save_back)
-                self._telemetry.record_eviction()
 
     def _evict_block(self, block_id: str, save_back: bool = False) -> None:
         """Evict a block from GPU.
@@ -957,14 +1204,26 @@ class StagehandScheduler:
         res_entry = self._residency.get_entry(block_id)
         module = block_entry.module_ref()
 
+        # EriQuant-backed blocks: delegate to the adapter.
+        if block_entry.eriquant_backed:
+            if self._eriquant_adapter is None:
+                log.error("Block %r is eriquant-backed but no adapter set — skipping evict", block_id)
+                return
+            self._residency.transition(block_id, BlockState.EVICTING)
+            self._eriquant_adapter.on_offload(block_id, "cpu")
+            res_entry.gpu_tensor = None
+            if res_entry.host_slab is not None:
+                self._engine._pool.release(res_entry.host_slab)
+                res_entry.host_slab = None
+            res_entry.param_layout = None
+            self._residency.transition(block_id, BlockState.UNLOADED)
+            return
+
         if save_back:
-            # Module-backed blocks larger than one slab: params live on the
-            # module itself.  Copy each GPU param to a standalone CPU tensor —
-            # no slab needed.  Smaller module-backed blocks use the normal
-            # slab-based D2H path.
-            is_module_backed = not block_entry.file_backed and not block_entry.squareq_backed
-            slab_bytes = self._engine._pool._slab_bytes if hasattr(self._engine._pool, "_slab_bytes") else float("inf")
-            if is_module_backed and block_entry.size_bytes > slab_bytes:
+            # Module-backed blocks: params live on the module itself.  Copy
+            # each GPU param to a standalone CPU tensor — no slab needed.
+            is_module_backed = not block_entry.file_backed and not block_entry.squareq_backed and not block_entry.eriquant_backed
+            if is_module_backed:
                 self._residency.transition(block_id, BlockState.EVICTING)
                 if module is not None:
                     for param in module.parameters():
@@ -986,13 +1245,35 @@ class StagehandScheduler:
                 self._residency.transition(block_id, BlockState.EVICTING)
 
                 mutable_names = set(block_entry.module_param_names)
+                keep_mutable_on_gpu = self._defer_backward_eviction and not self._backward_phase
+                file_specs = {spec.param_name: spec for spec in block_entry.file_param_specs}
+                base_file_view: memoryview | None = None
+                if any(not spec.file_path for spec in block_entry.file_param_specs):
+                    base_file_view = self._get_file_view(str(block_entry.source_path))
                 if module is not None and res_entry.param_layout is not None:
                     for name, _shape, dtype, _offset, _numel in res_entry.param_layout:
                         if name in mutable_names:
-                            cpu_copy = _get_param_data(module, name).to("cpu", non_blocking=True).clone()
-                            _set_param_data(module, name, cpu_copy)
+                            live_data = _get_param_data(module, name)
+                            target_device = live_data.device if keep_mutable_on_gpu else torch.device("cpu")
+                            copied = live_data.to(target_device, non_blocking=True).clone()
+                            _set_param_data(module, name, copied)
                         else:
-                            _set_param_data(module, name, torch.empty(0, dtype=dtype))
+                            restored = False
+                            if self._backward_phase and self._defer_backward_eviction:
+                                spec = file_specs.get(name)
+                                if spec is not None:
+                                    restored = _restore_file_backed_param_to_cpu_view(
+                                        module,
+                                        name,
+                                        spec,
+                                        source_path=str(block_entry.source_path),
+                                        runtime_dtype=dtype,
+                                        base_file_view=base_file_view,
+                                        get_file_view=self._get_file_view,
+                                        get_file_tensor_view=self._get_file_tensor_view,
+                                    )
+                            if not restored:
+                                _set_param_data(module, name, torch.empty(0, dtype=dtype))
 
                     for name, param in module.named_parameters():
                         if name in mutable_names and param.grad is not None and param.grad.device.type != "cpu":
@@ -1061,12 +1342,38 @@ class StagehandScheduler:
         else:
             # No save-back: GPU_READY -> GPU_FREEING -> UNLOADED.
             self._residency.transition(block_id, BlockState.GPU_FREEING)
-            # Detach module parameters from GPU storage BEFORE dropping
-            # gpu_tensor.  Without this, parameter views keep the underlying
-            # GPU storage alive and VRAM is never actually freed.
+
+            # For module-backed blocks (no file source), the module's own
+            # parameters are the ONLY source of data.  _detach_params would
+            # replace param.data with empty(0) tensors, destroying shapes AND
+            # data.  On the next _stage_block_to_host, _build_param_layout
+            # would see numel=0 for every param and produce a broken layout.
+            #
+            # Fix: copy GPU params back to standalone CPU tensors before
+            # dropping the GPU buffer.  This preserves both shape and data
+            # for re-staging while still freeing GPU memory.
+            is_module_backed = not block_entry.file_backed and not block_entry.squareq_backed and not block_entry.eriquant_backed
             if module is not None and res_entry.param_layout is not None:
-                _detach_params(module, res_entry.param_layout)
-            # Free GPU tensor — now safe because no views reference it.
+                if is_module_backed:
+                    # Save params to CPU so re-staging can read them back.
+                    for name, _shape, _dtype, _offset, _numel in res_entry.param_layout:
+                        gpu_data = _get_param_data(module, name)
+                        _set_param_data(module, name, gpu_data.to("cpu", non_blocking=True).clone())
+                elif block_entry.file_backed:
+                    resident_names = set(block_entry.module_param_names)
+                    keep_resident_on_gpu = self._defer_backward_eviction and not self._backward_phase
+                    for name, _shape, dtype, _offset, _numel in res_entry.param_layout:
+                        if name in resident_names:
+                            gpu_data = _get_param_data(module, name)
+                            target_device = gpu_data.device if keep_resident_on_gpu else torch.device("cpu")
+                            _set_param_data(module, name, gpu_data.to(target_device, non_blocking=True).clone())
+                        else:
+                            _set_param_data(module, name, torch.empty(0, dtype=dtype))
+                else:
+                    # SquareQ-backed: data can be re-read from source.
+                    _detach_params(module, res_entry.param_layout)
+
+            # Free GPU tensor — now safe because views have been replaced.
             res_entry.gpu_tensor = None
             # Release host slab if held.
             if res_entry.host_slab is not None:

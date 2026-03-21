@@ -5,9 +5,11 @@ and provides the :class:`StagehandRuntime` integration API.
 """
 from __future__ import annotations
 
+__version__ = "0.2.0"
+
 import logging
+import os
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Generator
 
 import torch
@@ -26,7 +28,7 @@ from stagehand.guards import NumericGuard
 from stagehand.layer import LayerRuntime
 from stagehand.pool import PinnedPool, PinnedSlab
 from stagehand.registry import BlockEntry, BlockRegistry, SquareQParamSpec
-from stagehand.residency import BlockState, ResidencyEntry, ResidencyMap, ResidentPriority
+from stagehand.residency import BlockState, ResidencyEntry, ResidencyMap
 from stagehand.scheduler import StaticLookaheadPolicy, StagehandScheduler
 from stagehand.telemetry import StagehandTelemetry, StepMetrics
 from stagehand.transfer import AsyncTransferEngine, TransferHandle
@@ -51,7 +53,6 @@ __all__ = [
     "BlockState",
     "ResidencyEntry",
     "ResidencyMap",
-    "ResidentPriority",
     # transfer
     "AsyncTransferEngine",
     "TransferHandle",
@@ -74,19 +75,8 @@ __all__ = [
     "Runtime",
 ]
 
-__version__ = "0.1.0"
-
 log = logging.getLogger(__name__)
-
-
-@dataclass
-class _ReservationEntry:
-    """Internal tracking for reserve_for_resident."""
-
-    runtime: object  # StagehandRuntime (forward ref)
-    size_bytes: int
-    block_ids: frozenset[str]
-    priority: ResidentPriority
+_DEBUG_STAGEHAND_SHUTDOWN = str(os.getenv("SERENITY_DEBUG_STAGEHAND_SHUTDOWN", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class StagehandRuntime:
@@ -227,6 +217,25 @@ class StagehandRuntime:
         )
         return converted
 
+    def convert_registry_to_squareq_v2_backed(
+        self, safetensors_path: str, manifest_path: str,
+    ) -> int:
+        """Convert registered blocks to SquareQ V2-backed mode.
+
+        Uses a pre-quantized INT8 safetensors slab and its JSON manifest
+        to back registered block parameters with quantized storage.
+        """
+        converted = self._registry.convert_to_squareq_v2_backed(
+            safetensors_path, manifest_path,
+        )
+        self._scheduler.refresh_registry_snapshot()
+        log.info(
+            "StagehandRuntime: converted %d params to SquareQ V2-backed source (%s)",
+            converted,
+            safetensors_path,
+        )
+        return converted
+
     def convert_registry_to_file_backed_sharded(self, source_dir: str) -> int:
         """Convert registered blocks to file-backed mode from sharded safetensors.
 
@@ -268,6 +277,7 @@ class StagehandRuntime:
     def _make_pre_backward_hook(self, block_id: str):  # noqa: ANN202
         """Create a pre-backward hook that ensures the block is on GPU."""
         def hook(module: nn.Module, grad_output: tuple) -> None:
+            self._scheduler.enter_backward_phase()
             self._scheduler.before_block(block_id)
         return hook
 
@@ -296,8 +306,13 @@ class StagehandRuntime:
         try:
             yield
         finally:
+            self._scheduler.exit_backward_phase()
             for h in handles:
                 h.remove()
+
+    def set_defer_backward_eviction(self, enabled: bool) -> None:
+        """Control whether eager post-backward evictions are deferred."""
+        self._scheduler.set_defer_backward_eviction(enabled)
 
     @contextmanager
     def managed_backward(self) -> Generator[None, None, None]:
@@ -330,153 +345,24 @@ class StagehandRuntime:
             for h in handles:
                 h.remove()
 
-    # ── residency protection ─────────────────────────────────────────
-
-    @contextmanager
-    def keep_resident(self, model_or_runtime: StagehandRuntime | None = None) -> Generator[None, None, None]:
-        """Suppress eviction of blocks for the duration of the context.
-
-        Blocks with refcount 0 will not be selected as eviction candidates
-        while this context is active. On context exit, protection is lifted.
-        Explicit eviction must be called separately if the model should be
-        unloaded.
-
-        If *model_or_runtime* is another ``StagehandRuntime``, its block IDs
-        are used. If ``None``, protects this runtime's own blocks.
-
-        Example::
-
-            with runtime.keep_resident():
-                result1 = model.generate(...)
-                result2 = model.encode(...)
-            # blocks are now normal eviction candidates again
-        """
-        target = model_or_runtime if model_or_runtime is not None else self
-        block_ids = frozenset(
-            entry.block_id for entry in target._registry.blocks_in_order()
-        )
-        if not block_ids:
-            log.warning(
-                "keep_resident: no blocks found. Model may not be registered "
-                "with Stagehand."
-            )
-            yield
-            return
-
-        self._scheduler.protect_blocks(block_ids)
-        log.debug("keep_resident: protecting %d blocks", len(block_ids))
-        try:
-            yield
-        finally:
-            self._scheduler.unprotect_blocks(block_ids)
-            log.debug("keep_resident: released protection for %d blocks", len(block_ids))
-
-    def reserve_for_resident(
-        self,
-        model_or_runtime: StagehandRuntime | None = None,
-        priority: ResidentPriority = ResidentPriority.PRIMARY,
-    ) -> None:
-        """Reserve VRAM headroom for a model that must stay resident.
-
-        Effects:
-        - All blocks are marked with the given priority
-        - BudgetManager subtracts model's size from "available for guests"
-        - Scheduler will not select PRIMARY blocks as eviction candidates
-          while reservation is active
-
-        If *model_or_runtime* is ``None``, reserves this runtime's own blocks.
-        """
-        target = model_or_runtime if model_or_runtime is not None else self
-        block_ids = frozenset(
-            entry.block_id for entry in target._registry.blocks_in_order()
-        )
-        size_bytes = sum(
-            entry.size_bytes for entry in target._registry.blocks_in_order()
-        )
-
-        if not hasattr(self, "_reservations"):
-            self._reservations: dict[int, _ReservationEntry] = {}
-
-        self._reservations[id(target)] = _ReservationEntry(
-            runtime=target,
-            size_bytes=size_bytes,
-            block_ids=block_ids,
-            priority=priority,
-        )
-
-        if priority == ResidentPriority.PRIMARY:
-            self._scheduler.protect_blocks(block_ids)
-        self._budget.reserve_bytes(size_bytes, label=repr(target))
-
-        log.info(
-            "reserve_for_resident: reserved %.2fGB (%d blocks) at priority=%s",
-            size_bytes / 1e9,
-            len(block_ids),
-            priority.value,
-        )
-
-    def release_reservation(
-        self,
-        model_or_runtime: StagehandRuntime | None = None,
-    ) -> None:
-        """Release a reservation, returning headroom to the guest pool."""
-        target = model_or_runtime if model_or_runtime is not None else self
-        if not hasattr(self, "_reservations"):
-            return
-        reservation = self._reservations.pop(id(target), None)
-        if reservation is None:
-            return
-        if reservation.priority == ResidentPriority.PRIMARY:
-            self._scheduler.unprotect_blocks(reservation.block_ids)
-        self._budget.release_reserved_bytes(reservation.size_bytes)
-        log.info(
-            "release_reservation: released %.2fGB reservation",
-            reservation.size_bytes / 1e9,
-        )
-
-    @contextmanager
-    def as_guest(self, guest_runtime: StagehandRuntime) -> Generator[None, None, None]:
-        """Load a short-lived guest model, evaluated against guest headroom only.
-
-        If insufficient guest headroom exists, the prefetch window is reduced.
-        Protected PRIMARY blocks are never evicted to make room for guests.
-        On context exit, the guest reservation is released.
-
-        Example::
-
-            with conductor.as_guest(spatial_upscaler):
-                result = spatial_upscaler.run(latent)
-            # guest_runtime evicted on context exit
-        """
-        size_bytes = sum(
-            entry.size_bytes for entry in guest_runtime._registry.blocks_in_order()
-        )
-
-        prev_window = None
-        if not self._budget.can_guest_allocate(size_bytes):
-            prev_window = self._scheduler._policy.prefetch_window
-            self._scheduler._policy.prefetch_window = 1
-            log.warning(
-                "as_guest: tight headroom for guest (%.2fGB), reduced prefetch window",
-                size_bytes / 1e9,
-            )
-
-        self.reserve_for_resident(guest_runtime, priority=ResidentPriority.GUEST)
-        try:
-            yield
-        finally:
-            self.release_reservation(guest_runtime)
-            if prev_window is not None:
-                self._scheduler._policy.prefetch_window = prev_window
-
     # ── shutdown ──────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
         """Clean shutdown: drain transfers, release pool, close telemetry."""
+        if _DEBUG_STAGEHAND_SHUTDOWN:
+            print("[stagehand/debug] runtime.shutdown: engine drain start", flush=True)
         self._engine.drain()
+        if _DEBUG_STAGEHAND_SHUTDOWN:
+            print("[stagehand/debug] runtime.shutdown: engine drain done", flush=True)
         self._scheduler.close()
+        if _DEBUG_STAGEHAND_SHUTDOWN:
+            print("[stagehand/debug] runtime.shutdown: scheduler close done", flush=True)
         self._pool.shutdown()
+        if _DEBUG_STAGEHAND_SHUTDOWN:
+            print("[stagehand/debug] runtime.shutdown: pool shutdown done", flush=True)
         self._telemetry.close()
+        if _DEBUG_STAGEHAND_SHUTDOWN:
+            print("[stagehand/debug] runtime.shutdown: telemetry close done", flush=True)
 
     def shutdown_keep_pool(self) -> PinnedPool:
         """Shut down runtime but return the pool for reuse by another runtime.
