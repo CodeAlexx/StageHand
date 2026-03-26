@@ -1,0 +1,16 @@
+[package]
+name = "stagehand-vmm"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "stagehand_vmm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+[features]
+gpu-tests = []
