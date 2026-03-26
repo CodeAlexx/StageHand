@@ -138,6 +138,39 @@ The shim calls `stagehand.layer()` internally and sets `is_ramtorch = True` on m
 
 **Limitation**: Stagehand wraps modules with hooks instead of replacing them with a different class. Code that uses `isinstance(module, ramtorch.Linear)` to identify managed modules will get `False` — use `getattr(module, "is_ramtorch", False)` instead.
 
+## VMM backend (experimental)
+
+On Ampere+ GPUs (SM 8.0+), Stagehand can use CUDA Virtual Memory Management for zero-overhead weight residency instead of block-swap. This is provided by the [stagehand-vmm](https://github.com/CodeAlexx/stagehand-vmm) Rust crate.
+
+**How it works**: Instead of copying weights between CPU and GPU via DMA, VMM maps physical VRAM pages directly into the model's virtual address space. The hot path (checking if a block is already resident) takes **250 ns** — an atomic load + refcount increment, no CUDA calls, no mutex. Getting a PyTorch tensor from a resident region takes **1.4 us** via DLPack zero-copy.
+
+**Two-layer architecture**:
+- **Layer 1 (RAM)**: Safetensors file mapped with `mmap(MAP_NORESERVE)`. OS manages pages as cache — zero committed RAM. Pages read from disk on demand, reclaimable instantly under pressure.
+- **Layer 2 (VRAM)**: CUDA VMM maps physical VRAM on demand (`cuMemCreate` + `cuMemMap`). Eviction via `cuMemUnmap` + `cuMemRelease`. CAS-based protocol prevents races with concurrent access.
+
+**Dual prefetch**: When prefetching a block, both layers warm simultaneously — `madvise(MADV_WILLNEED)` pre-faults file pages while the VMM async worker maps VRAM. By the time the block executes, both source and destination are ready.
+
+**Fallback**: VMM is optional. If `stagehand-vmm` isn't installed, the GPU is pre-Ampere, or a region is watermarked (VRAM ceiling exceeded), Stagehand falls back to the existing block-swap path automatically. No code changes needed.
+
+```python
+# VMM activates automatically in inference mode on Ampere+ GPUs
+runtime = StagehandRuntime(model, cfg, inference_mode=True)
+runtime.convert_registry_to_file_backed_sharded("/path/to/model")
+runtime.vmm_register_model("flux-dev", safetensors_path="/path/to/model.safetensors")
+
+with runtime.managed_forward():
+    output = model(input)
+```
+
+**Benchmarks** (RTX 3090, 24GB):
+| Operation | Latency |
+|-----------|---------|
+| ensure_resident (hot path) | 250 ns median |
+| ensure_resident + as_tensor | 1.4 us median |
+| Eviction + re-map (1.5GB region) | 4.2 ms median |
+
+**Requirements**: Ampere+ GPU (RTX 30xx, A100, etc.), Linux, `pip install stagehand-vmm`.
+
 ## Internals
 
 ### Pool (`PinnedPool`)
