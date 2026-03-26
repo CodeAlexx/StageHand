@@ -293,9 +293,15 @@ class LayerRuntime:
                 if id(module) in managed_ids:
                     continue
                 for p in module.parameters(recurse=False):
-                    p.data = p.data.to("cuda", dtype=dtype)
+                    if p.data.is_floating_point():
+                        p.data = p.data.to("cuda", dtype=dtype)
+                    else:
+                        p.data = p.data.to("cuda")
                 for name, buf in module.named_buffers(recurse=False):
-                    setattr(module, name, buf.to("cuda", dtype=dtype))
+                    if buf.is_floating_point():
+                        setattr(module, name, buf.to("cuda", dtype=dtype))
+                    else:
+                        setattr(module, name, buf.to("cuda"))
 
         # 7. Trace state.
         self._trace_order: list[str] = []

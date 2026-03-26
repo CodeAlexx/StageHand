@@ -32,6 +32,12 @@ from stagehand.residency import BlockState, ResidencyEntry, ResidencyMap
 from stagehand.scheduler import StaticLookaheadPolicy, StagehandScheduler
 from stagehand.telemetry import StagehandTelemetry, StepMetrics
 from stagehand.transfer import AsyncTransferEngine, TransferHandle
+try:
+    from stagehand.vmm_backend import VmmManager, VmmModelHandle, is_available as vmm_is_available
+except Exception:
+    VmmManager = None  # type: ignore[assignment,misc]
+    VmmModelHandle = None  # type: ignore[assignment,misc]
+    def vmm_is_available() -> bool: return False  # noqa: E704
 
 __all__ = [
     # config
@@ -176,11 +182,25 @@ class StagehandRuntime:
             inference_mode=inference_mode,
         )
 
+        # 6. VMM backend (optional, inference-only, Ampere+ GPUs).
+        self._vmm: VmmManager | None = None
+        self._vmm_active_blocks: dict[str, int] = {}  # block_id → block_idx
+        self._vmm_block_id_to_idx: dict[str, int] = {}
+        if inference_mode and vmm_is_available():
+            try:
+                self._vmm = VmmManager(device=0)
+                for i, entry in enumerate(self._registry.blocks_in_order()):
+                    self._vmm_block_id_to_idx[entry.block_id] = i
+            except Exception as e:
+                log.warning("VMM init failed, using block-swap: %s", e)
+                self._vmm = None
+
         log.info(
-            "StagehandRuntime: %d blocks registered, pool=%dMB, inference=%s",
+            "StagehandRuntime: %d blocks registered, pool=%dMB, inference=%s, vmm=%s",
             len(self._registry),
             config.pinned_pool_mb,
             inference_mode,
+            self._vmm is not None,
         )
 
     # ── step lifecycle ────────────────────────────────────────────────
@@ -253,17 +273,164 @@ class StagehandRuntime:
         )
         return converted
 
+    # ── VMM integration ─────────────────────────────────────────────
+
+    def vmm_register_model(
+        self,
+        model_id: str,
+        dtype_str: str = "bfloat16",
+        safetensors_path: str | None = None,
+    ) -> VmmModelHandle | None:
+        """Register the current model's blocks with the VMM backend.
+
+        Call after ``convert_registry_to_file_backed*`` so that block entries
+        have param_layout populated.
+
+        Returns the :class:`VmmModelHandle` or *None* if VMM is not available.
+        """
+        if self._vmm is None:
+            return None
+
+        ordered = self._registry.blocks_in_order()
+        block_sizes = [entry.size_bytes for entry in ordered]
+        handle = self._vmm.register_model(model_id, block_sizes, dtype_str)
+
+        # Register block shapes
+        for i, entry in enumerate(ordered):
+            total_elements = sum(
+                numel for _, _, _, _, numel in (entry.param_layout or [])
+            )
+            if total_elements > 0:
+                handle.register_block_shape(i, [total_elements])
+
+        # Set weight source: mmap (preferred) or committed RAM (fallback)
+        mmap_ok = False
+        if safetensors_path is not None and safetensors_path.endswith(".safetensors"):
+            block_tensor_map: list[list[str]] = []
+            for entry in ordered:
+                block_names = []
+                if entry.param_layout:
+                    module = entry.module_ref()
+                    model_root = self._model
+                    prefix = ""
+                    if model_root is not None and module is not None:
+                        for name, mod in model_root.named_modules():
+                            if mod is module:
+                                prefix = name + "." if name else ""
+                                break
+                    for param_name, _, _, _, _ in entry.param_layout:
+                        block_names.append(prefix + param_name)
+                block_tensor_map.append(block_names)
+
+            try:
+                handle.set_mmap_source(safetensors_path, block_tensor_map)
+                mmap_ok = True
+                log.info("VMM: using mmap source for %s: %s", model_id, safetensors_path)
+            except Exception as e:
+                log.warning("VMM: mmap source failed for %s: %s, falling back to RAM", model_id, e)
+
+        if not mmap_ok:
+            for i, entry in enumerate(ordered):
+                module = entry.module_ref()
+                if module is None or not entry.param_layout:
+                    continue
+                try:
+                    parts: list[torch.Tensor] = []
+                    for name, shape, layout_dtype, offset_bytes, numel in entry.param_layout:
+                        param = module
+                        for attr in name.split("."):
+                            param = getattr(param, attr)
+                        parts.append(
+                            param.data.to(layout_dtype).flatten().view(torch.uint8)
+                        )
+                    flat = torch.cat(parts).cpu()
+                    handle.set_ram_weights(i, flat)
+                except Exception:
+                    pass
+
+        self._vmm.activate_model(model_id)
+        self._vmm_model_id = model_id
+        log.info("VMM: registered model %s with %d blocks", model_id, len(block_sizes))
+        return handle
+
+    def _vmm_before_block(self, block_id: str, module: nn.Module) -> bool:
+        """Try to serve a block via VMM. Returns True if successful."""
+        if self._vmm is None:
+            return False
+
+        model_id = getattr(self, "_vmm_model_id", None)
+        if model_id is None or model_id not in self._vmm.models:
+            return False
+
+        block_idx = self._vmm_block_id_to_idx.get(block_id)
+        if block_idx is None:
+            return False
+
+        vmm_handle = self._vmm.models[model_id]
+        stream = torch.cuda.current_stream().cuda_stream
+
+        # Prefetch next block
+        vmm_handle.prefetch_block(block_idx + 1)
+
+        tensor, is_vmm = vmm_handle.get_block_tensor(block_idx, stream)
+        if not is_vmm:
+            return False  # watermarked — fall back to block-swap
+
+        try:
+            block_entry = self._registry.get(block_id)
+            if block_entry.param_layout:
+                from stagehand.scheduler import _restore_params_from_tensor
+                gpu_bytes = tensor.view(torch.uint8)
+                _restore_params_from_tensor(module, gpu_bytes, list(block_entry.param_layout))
+        except Exception as e:
+            log.warning("VMM: param restore failed for %s, falling back: %s", block_id, e)
+            vmm_handle.release_block(block_idx)
+            return False
+
+        self._vmm_active_blocks[block_id] = block_idx
+
+        self._scheduler._cursor += 1
+        self._telemetry.record_prefetch_hit()
+        self._scheduler._prefetch_ahead()
+
+        return True
+
+    def _vmm_after_block(self, block_id: str) -> None:
+        """Release VMM handle after block execution."""
+        block_idx = self._vmm_active_blocks.pop(block_id, None)
+        if block_idx is None:
+            return
+
+        block_entry = self._registry.get(block_id)
+        if block_entry is not None and block_entry.param_layout:
+            module = block_entry.module_ref()
+            if module is not None:
+                from stagehand.scheduler import _detach_params
+                _detach_params(module, list(block_entry.param_layout))
+
+        model_id = getattr(self, "_vmm_model_id", None)
+        if model_id is not None and model_id in self._vmm.models:
+            self._vmm.models[model_id].release_block(block_idx)
+
     # ── forward/backward hooks ────────────────────────────────────────
 
     def _make_pre_forward_hook(self, block_id: str):  # noqa: ANN202
-        """Create a pre-forward hook that ensures the block is on GPU."""
+        """Create a pre-forward hook that ensures the block is on GPU.
+
+        Tries VMM fast path first (inference only), falls back to block-swap.
+        """
         def hook(module: nn.Module, args: tuple) -> None:
+            if self._vmm is not None and self._vmm_before_block(block_id, module):
+                return  # VMM served the block
             self._scheduler.before_block(block_id)
         return hook
 
     def _make_post_forward_hook(self, block_id: str):  # noqa: ANN202
         """Create a post-forward hook that releases the block's refcount."""
         def hook(module: nn.Module, args: tuple, output: object) -> None:
+            if block_id in self._vmm_active_blocks:
+                self._vmm_after_block(block_id)
+                return
             out_tensor: torch.Tensor | None = None
             if isinstance(output, torch.Tensor):
                 out_tensor = output
@@ -349,6 +516,9 @@ class StagehandRuntime:
 
     def shutdown(self) -> None:
         """Clean shutdown: drain transfers, release pool, close telemetry."""
+        if self._vmm is not None:
+            self._vmm.shutdown()
+            self._vmm = None
         if _DEBUG_STAGEHAND_SHUTDOWN:
             print("[stagehand/debug] runtime.shutdown: engine drain start", flush=True)
         self._engine.drain()
@@ -372,6 +542,9 @@ class StagehandRuntime:
         passing the pool to a new ``StagehandRuntime`` or calling
         ``pool.shutdown()`` when done.
         """
+        if self._vmm is not None:
+            self._vmm.shutdown()
+            self._vmm = None
         self._engine.drain()
         self._scheduler.close()
         self._telemetry.close()
