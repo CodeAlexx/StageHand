@@ -390,6 +390,9 @@ class LayerRuntime:
     def _make_trace_pre_hook(self, layer_id: str):  # noqa: ANN202
         """Forward pre-hook for trace mode: records order + auto-step."""
         def hook(module: nn.Module, args: tuple) -> None:
+            # DEBUG: track first 10 hooks + embedder hooks
+            if len(self._trace_order) < 10 or "x_embedder" in layer_id or "context_embedder" in layer_id:
+                print(f"[STAGEHAND-DEBUG] TRACE pre-hook fired: {layer_id}, forward_started={self._forward_started}, step={self._step}, trace_len={len(self._trace_order)}")
             # Auto-step detection: if the first traced layer fires again,
             # the trace is complete and we rebuild.
             if (
@@ -422,6 +425,9 @@ class LayerRuntime:
     def _make_scheduled_pre_hook(self, layer_id: str):  # noqa: ANN202
         """Forward pre-hook for scheduled mode: auto-step + before_block."""
         def hook(module: nn.Module, args: tuple) -> None:
+            # DEBUG: track hook firing
+            if "x_embedder" in layer_id or "context_embedder" in layer_id:
+                print(f"[STAGEHAND-DEBUG] SCHEDULED pre-hook fired: {layer_id}, forward_started={self._forward_started}, step={self._step}")
             # Auto-step: when first layer fires again, end previous step.
             if layer_id == self._trace_order[0] and self._forward_started:
                 self._record_pool_stats()

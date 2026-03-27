@@ -1228,9 +1228,9 @@ class StagehandScheduler:
                 if module is not None:
                     for param in module.parameters():
                         if param.data.device.type != "cpu":
-                            param.data = param.data.to("cpu", non_blocking=True).clone()
+                            param.data = param.data.to("cpu").clone()
                         if param.grad is not None and param.grad.device.type != "cpu":
-                            param.grad = param.grad.to("cpu", non_blocking=True)
+                            param.grad = param.grad.to("cpu")
                 res_entry.gpu_tensor = None
                 if res_entry.host_slab is not None:
                     self._engine._pool.release(res_entry.host_slab)
@@ -1255,7 +1255,7 @@ class StagehandScheduler:
                         if name in mutable_names:
                             live_data = _get_param_data(module, name)
                             target_device = live_data.device if keep_mutable_on_gpu else torch.device("cpu")
-                            copied = live_data.to(target_device, non_blocking=True).clone()
+                            copied = live_data.to(target_device).clone()
                             _set_param_data(module, name, copied)
                         else:
                             restored = False
@@ -1358,7 +1358,7 @@ class StagehandScheduler:
                     # Save params to CPU so re-staging can read them back.
                     for name, _shape, _dtype, _offset, _numel in res_entry.param_layout:
                         gpu_data = _get_param_data(module, name)
-                        _set_param_data(module, name, gpu_data.to("cpu", non_blocking=True).clone())
+                        _set_param_data(module, name, gpu_data.to("cpu").clone())
                 elif block_entry.file_backed:
                     resident_names = set(block_entry.module_param_names)
                     keep_resident_on_gpu = self._defer_backward_eviction and not self._backward_phase
@@ -1366,7 +1366,7 @@ class StagehandScheduler:
                         if name in resident_names:
                             gpu_data = _get_param_data(module, name)
                             target_device = gpu_data.device if keep_resident_on_gpu else torch.device("cpu")
-                            _set_param_data(module, name, gpu_data.to(target_device, non_blocking=True).clone())
+                            _set_param_data(module, name, gpu_data.to(target_device).clone())
                         else:
                             _set_param_data(module, name, torch.empty(0, dtype=dtype))
                 else:

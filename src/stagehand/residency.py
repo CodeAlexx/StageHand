@@ -120,6 +120,18 @@ class ResidencyMap:
             )
         entry.state = new_state
 
+    # ── bulk operations ─────────────────────────────────────────────
+
+    def reset_all_to_unloaded(self) -> None:
+        """Force all entries to UNLOADED with zero refcount.
+
+        Used after an external system (e.g. Turbo block-swap) has moved
+        all blocks off GPU without going through the normal FSM transitions.
+        """
+        for entry in self._entries.values():
+            entry.state = BlockState.UNLOADED
+            entry.refcount = 0
+
     # ── refcount ─────────────────────────────────────────────────────
 
     def increment_ref(self, block_id: str) -> None:
