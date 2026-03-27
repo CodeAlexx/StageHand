@@ -2,13 +2,16 @@
 
 GPU memory orchestrator for PyTorch. Streams model weights between CPU and GPU so models larger than VRAM can run without quantization.
 
-**Status**: Alpha (`0.1.0`). API may change. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training.
+**Status**: Alpha (`0.1.0`). API may change. Used in [Serenity](https://github.com/CodeAlexx/Serenity) and [ai-toolkit](https://github.com/ostris/ai-toolkit) for diffusion model training.
 
 **Case studies** (these use Stagehand within [Serenity](https://github.com/CodeAlexx/Serenity)):
 - [LTX-2 19B + Gemma 3 12B trained in full bf16 on a single 24GB GPU](docs/case-study-ltx2-bf16.md) — 31.9B total parameters, no quantization, 9.5s/step
 - [Flux 2 Dev 12B + Mistral 3 24B with SquareQ INT8 on a single 24GB GPU](docs/case-study-flux2dev-squareq.md) — 36B total parameters, INT8 frozen weights, 6 GB VRAM steady state
 - [Flux 1 Dev 12B LoRA at 2048x2048 on 4.15 GB VRAM](docs/case-study-flux-2048-lora.md) — full bf16, no quantization, 90% of layers offloaded to CPU
 - [Porting the Conductor to LTX-Desktop](docs/case-study-ltx-desktop-conductor.md) — LTX-2 19B LoRA on 24 GB, and the `use_reentrant` gradient bug with dataclass block interfaces
+
+**Third-party integrations**:
+- [ai-toolkit](https://github.com/ostris/ai-toolkit) — Kohya-style block swap for training + Turbo engine for sampling. See [integration docs](docs/ai-toolkit-integration.md).
 
 ## Docs
 
@@ -42,6 +45,31 @@ The GPU never runs out of memory because the pool is bounded and eviction is enf
 - **Module-backed** (default): Weights live in CPU RAM. On load: copy to GPU tensor, repoint `module.weight.data` into it. On eviction: copy back to CPU, repoint back. This is a full round-trip every time.
 - **File-backed**: Weights live on disk as safetensors. On load: mmap read → pinned slab → GPU. On eviction (inference): just drop the GPU tensor — weights reload from disk on next use. No CPU RAM needed for frozen weights.
 - **SquareQ-backed**: INT8 quantized format (`.fpk`/`.slab`). Dequantized to target dtype during host staging. Same eviction behavior as file-backed.
+
+## Turbo engine (Rust)
+
+For sampling/inference, Stagehand includes an optional Rust-based engine (`TurboConductor`) that manages GPU slot pools with dedicated CUDA streams. It's ~10x faster than the Python path because it eliminates Python overhead from the hot loop.
+
+```python
+from stagehand.turbo import TurboConductor, is_available
+
+if is_available():
+    turbo = TurboConductor(
+        model=transformer,
+        block_pattern=r"(transformer_blocks|single_transformer_blocks)\.\d+$",
+        dtype=torch.bfloat16,
+        device=0,
+        vram_budget_gb=18.0,
+    )
+    turbo.prepare()
+
+    # Per-block hooks call turbo.before_block(i) / turbo.after_block(i)
+    # Turbo handles prefetch, eviction, and stream synchronization in Rust
+```
+
+**Requirements**: `pip install stagehand[turbo]` (builds the Rust crate via maturin). Falls back to Python path if unavailable.
+
+**How it works**: Pre-allocates a fixed pool of GPU memory slots sized to the largest block. Dedicated CUDA streams handle H2D copies. `before_block()` ensures the block is resident (prefetching if needed), `after_block()` marks it reclaimable. All synchronization uses CUDA events, not Python locks.
 
 ## Two modes
 
@@ -244,7 +272,7 @@ pytest tests/ -x -q
 - **Gradient accumulation + tight VRAM budget**. When eviction happens during backward, PyTorch's `AccumulateGrad` node runs after the backward post-hook — so eviction moves `param.grad` to CPU before `AccumulateGrad` can accumulate on GPU, causing a device mismatch. Workaround: use a generous VRAM budget for gradient accumulation so no eviction occurs during backward. Single forward+backward per step (the common case) works fine with any budget.
 - **No gradient checkpointing integration**. Stagehand's backward hooks coexist with PyTorch's autograd but don't coordinate with `torch.utils.checkpoint`.
 - **Pool sizing is fragile**. If the largest layer doesn't fit in one slab, init fails with `StagehandOOMError`. Auto-sizing in layer mode handles this, but block mode requires manual slab sizing.
-- **Alpha quality**. Used in [Serenity](https://github.com/CodeAlexx/Serenity) for diffusion model training. The API surface is small but not battle-tested.
+- **Alpha quality**. Used in [Serenity](https://github.com/CodeAlexx/Serenity) and [ai-toolkit](https://github.com/ostris/ai-toolkit) for diffusion model training. The API surface is small but not battle-tested.
 
 ## License
 
