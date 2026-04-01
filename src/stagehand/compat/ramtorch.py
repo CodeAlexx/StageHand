@@ -61,7 +61,7 @@ def replace_linear_with_ramtorch(
     The same model instance, now managed by stagehand with ``is_ramtorch``
     flags set on all managed modules and parameters.
     """
-    import serenity.stagehand as stagehand
+    import stagehand
 
     kwargs: dict = dict(
         vram_budget=vram_budget,

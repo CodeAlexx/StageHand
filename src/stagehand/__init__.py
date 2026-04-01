@@ -5,8 +5,6 @@ and provides the :class:`StagehandRuntime` integration API.
 """
 from __future__ import annotations
 
-__version__ = "0.2.0"
-
 import logging
 import os
 from contextlib import contextmanager
@@ -35,6 +33,8 @@ from stagehand.transfer import AsyncTransferEngine, TransferHandle
 try:
     from stagehand.vmm_backend import VmmManager, VmmModelHandle, is_available as vmm_is_available
 except Exception:
+    # vmm_backend.py itself should always import fine (only depends on torch),
+    # but guard anyway so a broken install never breaks the whole package.
     VmmManager = None  # type: ignore[assignment,misc]
     VmmModelHandle = None  # type: ignore[assignment,misc]
     def vmm_is_available() -> bool: return False  # noqa: E704
@@ -189,6 +189,7 @@ class StagehandRuntime:
         if inference_mode and vmm_is_available():
             try:
                 self._vmm = VmmManager(device=0)
+                # Build block_id → index mapping
                 for i, entry in enumerate(self._registry.blocks_in_order()):
                     self._vmm_block_id_to_idx[entry.block_id] = i
             except Exception as e:
@@ -286,6 +287,17 @@ class StagehandRuntime:
         Call after ``convert_registry_to_file_backed*`` so that block entries
         have param_layout populated.
 
+        Parameters
+        ----------
+        model_id:
+            Unique identifier for this model (e.g. ``"diffusion:flux-dev"``).
+        dtype_str:
+            Weight dtype for DLPack tensors (``"bfloat16"``, ``"float16"``, etc.).
+        safetensors_path:
+            If provided, weights are loaded via uncommitted mmap from this
+            file — zero committed RAM.  If *None*, falls back to materializing
+            CPU weight copies (uses committed RAM).
+
         Returns the :class:`VmmModelHandle` or *None* if VMM is not available.
         """
         if self._vmm is None:
@@ -306,11 +318,18 @@ class StagehandRuntime:
         # Set weight source: mmap (preferred) or committed RAM (fallback)
         mmap_ok = False
         if safetensors_path is not None and safetensors_path.endswith(".safetensors"):
+            # Build tensor name map: which safetensors keys belong to which block.
+            # The state_dict key prefix for each block comes from the registry.
             block_tensor_map: list[list[str]] = []
             for entry in ordered:
+                # Collect param names that belong to this block.
+                # The registry stores dotted names relative to the block module,
+                # but safetensors keys are fully-qualified from the model root.
+                # Use the block's module name prefix from the model.
                 block_names = []
                 if entry.param_layout:
-                    module = entry.module_ref()
+                    module = entry.module_ref()  # weakref deref → nn.Module
+                    # Find the block's prefix in the model's named_modules
                     model_root = self._model
                     prefix = ""
                     if model_root is not None and module is not None:
@@ -330,8 +349,9 @@ class StagehandRuntime:
                 log.warning("VMM: mmap source failed for %s: %s, falling back to RAM", model_id, e)
 
         if not mmap_ok:
+            # Fallback: materialize CPU weight copies
             for i, entry in enumerate(ordered):
-                module = entry.module_ref()
+                module = entry.module_ref()  # weakref deref → nn.Module
                 if module is None or not entry.param_layout:
                     continue
                 try:
@@ -376,6 +396,8 @@ class StagehandRuntime:
         if not is_vmm:
             return False  # watermarked — fall back to block-swap
 
+        # Restore module params from the VMM tensor using the param layout.
+        # If this fails, release the VMM handle and fall back to block-swap.
         try:
             block_entry = self._registry.get(block_id)
             if block_entry.param_layout:
@@ -389,6 +411,9 @@ class StagehandRuntime:
 
         self._vmm_active_blocks[block_id] = block_idx
 
+        # Advance scheduler cursor so prefetch predictions stay aligned.
+        # Also trigger prefetch-ahead — without this, mixed VMM/block-swap
+        # sequences would starve the prefetcher.
         self._scheduler._cursor += 1
         self._telemetry.record_prefetch_hit()
         self._scheduler._prefetch_ahead()
@@ -396,11 +421,21 @@ class StagehandRuntime:
         return True
 
     def _vmm_after_block(self, block_id: str) -> None:
-        """Release VMM handle after block execution."""
+        """Release VMM handle after block execution.
+
+        Detaches module params from the VMM tensor BEFORE releasing the handle.
+        Without this, param views keep the DLPack tensor alive → region refcount
+        stays at 1 → the VMM allocator cannot evict/unmap the region.
+        """
         block_idx = self._vmm_active_blocks.pop(block_id, None)
         if block_idx is None:
             return
 
+        # Detach module params from VMM tensor views. This drops the DLPack
+        # tensor's last Python reference (param views were the only holders),
+        # triggering the DLPack deleter which decrements the VMM refcount.
+        # Uses the existing _detach_params which replaces param.data with
+        # empty(0) tensors, matching what the block-swap eviction path does.
         block_entry = self._registry.get(block_id)
         if block_entry is not None and block_entry.param_layout:
             module = block_entry.module_ref()
@@ -515,7 +550,15 @@ class StagehandRuntime:
     # ── shutdown ──────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
-        """Clean shutdown: drain transfers, release pool, close telemetry."""
+        """Clean shutdown: drain transfers, release pool, close telemetry.
+
+        TODO(phase3-audit): VMM SHUTDOWN WITHOUT PARAM DETACH — vmm.shutdown()
+        calls destroy() on each VmmModelHandle, which calls destroy_slab().
+        If any module params still hold views into DLPack tensors from as_tensor(),
+        destroy_slab() will fail with SlabNotEmpty. Must iterate all registered
+        blocks and _detach_params() before calling vmm.shutdown().
+        Same issue in shutdown_keep_pool() below.
+        """
         if self._vmm is not None:
             self._vmm.shutdown()
             self._vmm = None
@@ -541,6 +584,8 @@ class StagehandRuntime:
         shut down the pinned pool.  The caller is responsible for either
         passing the pool to a new ``StagehandRuntime`` or calling
         ``pool.shutdown()`` when done.
+
+        TODO(phase3-audit): Same VMM param detach issue as shutdown() — see above.
         """
         if self._vmm is not None:
             self._vmm.shutdown()

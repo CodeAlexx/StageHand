@@ -28,15 +28,9 @@ if TYPE_CHECKING:
     from stagehand.residency import ResidencyEntry, ResidencyMap
     from stagehand.telemetry import StagehandTelemetry
     from stagehand.transfer import AsyncTransferEngine, TransferHandle
-    try:
-        from serenity.memory.adapters.stagehand_conductor import StagehandConductorAdapter
-        from serenity.memory.adapters.squareq_conductor import SquareQConductorAdapter
-    except ImportError:
-        pass
-    try:
-        from eriquant.stagehand.adapter import StagehandAdapter as EriQuantAdapter
-    except ImportError:
-        pass
+    from serenity.memory.adapters.stagehand_conductor import StagehandConductorAdapter
+    from serenity.memory.adapters.squareq_conductor import SquareQConductorAdapter
+    from eriquant.stagehand.adapter import StagehandAdapter as EriQuantAdapter
 
 __all__ = ["StaticLookaheadPolicy", "StagehandScheduler"]
 
@@ -648,10 +642,7 @@ class StagehandScheduler:
             return cached
 
         manifest_path = str(Path(key).with_suffix(".manifest.json"))
-        try:
-            from serenity.squareq.stagehand import get_squareq_v2_layers
-        except ImportError:
-            from squareq.bridge import get_squareq_v2_layers  # standalone fallback
+        from serenity.squareq.stagehand import get_squareq_v2_layers
 
         layers = get_squareq_v2_layers(key, manifest_path)
         self._squareq_layers[key] = layers
@@ -736,7 +727,7 @@ class StagehandScheduler:
                 # Bandwidth scheduling disabled in adapter — proceed.
                 return True
 
-            from serenity.memory.conductor.bandwidth import AcquireStatus  # type: ignore[import-not-found]
+            from serenity.memory.conductor.bandwidth import AcquireStatus
             if result.status == AcquireStatus.ACQUIRED and result.token is not None:
                 self._pending_bw_tokens[block_id] = (result.token, time.monotonic())
                 return True
